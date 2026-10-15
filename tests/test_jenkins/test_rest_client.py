@@ -1,0 +1,1690 @@
+import pytest
+from requests import HTTPError
+from requests.auth import HTTPBasicAuth
+
+from mcp_jenkins.jenkins import Jenkins, PendingInputsUnavailableError
+from mcp_jenkins.jenkins.model.build import Artifact, Build, BuildReplay, PendingInput
+from mcp_jenkins.jenkins.model.item import (
+    Folder,
+    FreeStyleProject,
+    Job,
+    MultiBranchProject,
+)
+from mcp_jenkins.jenkins.model.node import (
+    Node,
+    NodeExecutor,
+    NodeExecutorCurrentExecutable,
+)
+from mcp_jenkins.jenkins.model.queue import Queue, QueueItem, QueueItemTask
+
+
+@pytest.fixture(autouse=True)
+def mock_session(mocker):
+    mock_session = mocker.Mock()
+    mocker.patch(
+        'mcp_jenkins.jenkins.rest_client.requests.Session',
+        autospec=True,
+        return_value=mock_session,
+    )
+    yield mock_session
+
+
+@pytest.fixture
+def jenkins(mocker):
+    jenkins = Jenkins(url='https://example.com/', username='username', password='password')
+    mocker.patch.object(
+        Jenkins,
+        'crumb_header',
+        new_callable=mocker.PropertyMock,
+        return_value={'Jenkins-Crumb': 'crumb-value'},
+    )
+    return jenkins
+
+
+class TestAuth:
+    @pytest.mark.parametrize(('username', 'password'), [(None, None), ('', '')])
+    def test_no_credentials_leaves_session_anonymous(self, mock_session, username, password):
+        # A real Session starts with auth=None; the Mock would otherwise auto-create the attribute.
+        mock_session.auth = None
+
+        Jenkins(url='https://example.com/', username=username, password=password)
+
+        assert mock_session.auth is None
+
+    def test_credentials_set_basic_auth(self, mock_session):
+        Jenkins(url='https://example.com/', username='alice', password='s3cret')
+
+        assert mock_session.auth == HTTPBasicAuth('alice', 's3cret')
+
+
+def test_endpoint_url(jenkins):
+    assert jenkins.endpoint_url('/api/json') == jenkins.endpoint_url('api/json') == 'https://example.com/api/json'
+
+
+class TestRequest:
+    def test_request_with_crumb(self, jenkins, mock_session):
+        jenkins.request('GET', 'api/json', crumb=True)
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/api/json',
+            headers={
+                'Jenkins-Crumb': 'crumb-value',
+            },
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_request_without_crumb(self, jenkins, mock_session):
+        jenkins.request('GET', 'api/json', crumb=False, headers={'Custom-Header': 'value'})
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/api/json',
+            headers={
+                'Custom-Header': 'value',
+            },
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+
+class TestCrumbHeader:
+    def test_crumb_header(self, mocker):
+        jenkins = Jenkins(url='https://example.com/', username='username', password='password')
+        mocker.patch.object(
+            jenkins,
+            'request',
+            return_value=mocker.Mock(
+                json=lambda: {
+                    'crumbRequestField': 'Jenkins-Crumb',
+                    'crumb': 'crumb-value',
+                }
+            ),
+        )
+        assert jenkins.crumb_header == {'Jenkins-Crumb': 'crumb-value'}
+
+    def test_crumb_header_404(self, mocker):
+        jenkins = Jenkins(url='https://example.com/', username='username', password='password')
+        mocker.patch.object(
+            jenkins,
+            'request',
+            side_effect=HTTPError(response=mocker.Mock(status_code=404)),
+        )
+
+        assert jenkins.crumb_header == {}
+
+    def test_crumb_header_other_http_error(self, mocker):
+        jenkins = Jenkins(url='https://example.com/', username='username', password='password')
+        mocker.patch.object(
+            jenkins,
+            'request',
+            side_effect=HTTPError(response=mocker.Mock(status_code=500)),
+        )
+
+        with pytest.raises(HTTPError):
+            _ = jenkins.crumb_header
+
+
+class TestCrumbRetry:
+    def test_retry_on_403_refreshes_crumb(self, mock_session, mocker):
+        j = Jenkins(url='https://example.com/', username='username', password='password')
+        # Simulate stale crumb cached from earlier
+        j._crumb_header = {'Jenkins-Crumb': 'stale-crumb'}
+
+        forbidden_resp = mocker.Mock(status_code=403)
+        forbidden_resp.raise_for_status.side_effect = HTTPError(response=forbidden_resp)
+
+        success_resp = mocker.Mock(status_code=201)
+        success_resp.raise_for_status.return_value = None
+
+        crumb_resp = mocker.Mock(
+            status_code=200,
+            json=lambda: {'crumbRequestField': 'Jenkins-Crumb', 'crumb': 'fresh-crumb'},
+        )
+        crumb_resp.raise_for_status.return_value = None
+
+        # First POST → 403, crumb refresh GET → new crumb, retry POST → 201
+        mock_session.request.side_effect = [forbidden_resp, crumb_resp, success_resp]
+
+        result = j.request('POST', 'job/test/build')
+
+        assert result.status_code == 201
+        assert j._crumb_header == {'Jenkins-Crumb': 'fresh-crumb'}
+        assert mock_session.request.call_count == 3
+
+    def test_no_retry_when_crumb_was_empty(self, mock_session, mocker):
+        j = Jenkins(url='https://example.com/', username='username', password='password')
+        # Empty crumb (CSRF disabled) — should NOT retry on 403
+        j._crumb_header = {}
+
+        forbidden_resp = mocker.Mock(status_code=403)
+        forbidden_resp.raise_for_status.side_effect = HTTPError(response=forbidden_resp)
+        mock_session.request.return_value = forbidden_resp
+
+        with pytest.raises(HTTPError):
+            j.request('POST', 'job/test/build')
+
+        assert mock_session.request.call_count == 1
+
+    def test_no_retry_on_non_403_errors(self, mock_session, mocker):
+        """Server errors (500, 401, etc.) must not trigger the crumb retry path."""
+        j = Jenkins(url='https://example.com/', username='username', password='password')
+        j._crumb_header = {'Jenkins-Crumb': 'some-crumb'}
+
+        for status in (401, 500, 502):
+            mock_session.reset_mock()
+            error_resp = mocker.Mock(status_code=status)
+            error_resp.raise_for_status.side_effect = HTTPError(response=error_resp)
+            mock_session.request.return_value = error_resp
+
+            with pytest.raises(HTTPError):
+                j.request('POST', 'job/test/build')
+
+            # Only 1 call — no retry
+            assert mock_session.request.call_count == 1
+
+    def test_no_retry_when_crumb_is_false(self, mock_session, mocker):
+        """Requests with crumb=False must never trigger the retry path, even on 403."""
+        j = Jenkins(url='https://example.com/', username='username', password='password')
+        j._crumb_header = {'Jenkins-Crumb': 'some-crumb'}
+
+        forbidden_resp = mocker.Mock(status_code=403)
+        forbidden_resp.raise_for_status.side_effect = HTTPError(response=forbidden_resp)
+        mock_session.request.return_value = forbidden_resp
+
+        with pytest.raises(HTTPError):
+            j.request('GET', 'crumbIssuer/api/json', crumb=False)
+
+        assert mock_session.request.call_count == 1
+
+    def test_retry_also_fails_raises_original_error(self, mock_session, mocker):
+        """When the retry request also returns 403, the error must propagate."""
+        j = Jenkins(url='https://example.com/', username='username', password='password')
+        j._crumb_header = {'Jenkins-Crumb': 'stale-crumb'}
+
+        forbidden_resp = mocker.Mock(status_code=403)
+        forbidden_resp.raise_for_status.side_effect = HTTPError(response=forbidden_resp)
+
+        crumb_resp = mocker.Mock(
+            status_code=200,
+            json=lambda: {'crumbRequestField': 'Jenkins-Crumb', 'crumb': 'fresh-crumb'},
+        )
+        crumb_resp.raise_for_status.return_value = None
+
+        still_forbidden_resp = mocker.Mock(status_code=403)
+        still_forbidden_resp.raise_for_status.side_effect = HTTPError(response=still_forbidden_resp)
+
+        # First POST → 403, crumb refresh → ok, retry POST → still 403
+        mock_session.request.side_effect = [forbidden_resp, crumb_resp, still_forbidden_resp]
+
+        with pytest.raises(HTTPError) as exc_info:
+            j.request('POST', 'job/test/build')
+
+        assert exc_info.value.response.status_code == 403
+        assert mock_session.request.call_count == 3
+
+
+def test_job_path(jenkins):
+    assert jenkins._job_path('job-name') == 'job/job-name'
+    assert jenkins._job_path('folder/job-name') == 'job/folder/job/job-name'
+    assert jenkins._job_path('folder/subfolder/job-name') == 'job/folder/job/subfolder/job/job-name'
+
+
+def test_job_path_matrix_configuration(jenkins):
+    assert jenkins._job_path('matrix-job/jdk=17') == 'job/matrix-job/jdk=17'
+    assert jenkins._job_path('folder/matrix-job/jdk=17,label=test:linux') == (
+        'job/folder/job/matrix-job/jdk=17,label=test:linux'
+    )
+    # A top-level job is never a configuration, whatever its name
+    assert jenkins._job_path('a=b') == 'job/a=b'
+
+
+class TestView:
+    def test_build_view_path(self, jenkins):
+        assert jenkins._build_view_path('All') == 'view/All'
+        assert jenkins._build_view_path('frontend/nightly') == 'view/frontend/view/nightly'
+        assert jenkins._build_view_path('frontend/nightly/nightly linux') == (
+            'view/frontend/view/nightly/view/nightly%20linux'
+        )
+
+    def test_get_views(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'views': [
+                    {'name': 'All', 'url': 'https://example.com/view/All/'},
+                    {'name': 'frontend', 'url': 'https://example.com/view/frontend/'},
+                ]
+            }
+        )
+
+        assert jenkins.get_views() == [
+            {'name': 'All', 'url': 'https://example.com/view/All/'},
+            {'name': 'frontend', 'url': 'https://example.com/view/frontend/'},
+        ]
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/api/json?tree=views[name,url]',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_view(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'name': 'frontend',
+                'jobs': [
+                    {
+                        'name': 'build-ui',
+                        'url': 'https://example.com/job/build-ui/',
+                        'color': 'blue',
+                    }
+                ],
+            }
+        )
+
+        result = jenkins.get_view(view_path='frontend')
+
+        assert result == {
+            'name': 'frontend',
+            'jobs': [
+                {
+                    'name': 'build-ui',
+                    'url': 'https://example.com/job/build-ui/',
+                    'color': 'blue',
+                }
+            ],
+        }
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/view/frontend/api/json?depth=0',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_view_nested(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'name': 'nightly linux',
+                'jobs': [
+                    {
+                        'name': 'integration-tests',
+                        'url': 'https://example.com/job/integration-tests/',
+                        'color': 'blue',
+                    }
+                ],
+            }
+        )
+
+        result = jenkins.get_view(view_path='frontend/nightly/nightly linux')
+
+        assert result['name'] == 'nightly linux'
+        assert len(result['jobs']) == 1
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/view/frontend/view/nightly/view/nightly%20linux/api/json?depth=0',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+
+class TestQueue:
+    def test_get_queue(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'items': [
+                    {
+                        'id': 1,
+                        'inQueueSince': 1767975558000,
+                        'url': 'https://example.com/queue/item/1/',
+                        'why': 'Waiting for next available executor',
+                        'task': {
+                            'fullDisplayName': 'Example Job',
+                            'name': 'example-job',
+                            'url': 'https://example.com/job/example-job/',
+                        },
+                    }
+                ],
+                'discoverableItems': [],
+            }
+        )
+
+        assert jenkins.get_queue() == Queue(
+            items=[
+                QueueItem(
+                    id=1,
+                    inQueueSince=1767975558000,
+                    url='https://example.com/queue/item/1/',
+                    why='Waiting for next available executor',
+                    task=QueueItemTask(
+                        fullDisplayName='Example Job',
+                        name='example-job',
+                        url='https://example.com/job/example-job/',
+                    ),
+                )
+            ],
+            discoverableItems=[],
+        )
+
+    def test_get_queue_item(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'id': 1,
+                'inQueueSince': 1767975558000,
+                'url': 'https://example.com/queue/item/1/',
+                'why': 'Waiting for next available executor',
+                'task': {
+                    'fullDisplayName': 'Example Job',
+                    'name': 'example-job',
+                    'url': 'https://example.com/job/example-job/',
+                },
+            }
+        )
+
+        assert jenkins.get_queue_item(id=1) == QueueItem(
+            id=1,
+            inQueueSince=1767975558000,
+            url='https://example.com/queue/item/1/',
+            why='Waiting for next available executor',
+            task=QueueItemTask(
+                fullDisplayName='Example Job',
+                name='example-job',
+                url='https://example.com/job/example-job/',
+            ),
+        )
+
+    def test_cancel_queue_item(self, jenkins, mock_session):
+        assert jenkins.cancel_queue_item(id=42) is None
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/queue/cancelItem?id=42',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+
+class TestNode:
+    def test_get_node(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'displayName': 'node-1',
+                'offline': False,
+                'executors': [
+                    {
+                        'currentExecutable': {
+                            'url': 'https://example.com/job/example-job/1/',
+                            'timestamp': 1767975558000,
+                            'number': 1,
+                            'fullDisplayName': 'Example Job #1',
+                        }
+                    }
+                ],
+            }
+        )
+
+        assert jenkins.get_node(name='node-1') == Node(
+            displayName='node-1',
+            offline=False,
+            executors=[
+                NodeExecutor(
+                    currentExecutable=NodeExecutorCurrentExecutable(
+                        url='https://example.com/job/example-job/1/',
+                        timestamp=1767975558000,
+                        number=1,
+                        fullDisplayName='Example Job #1',
+                    )
+                )
+            ],
+        )
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/computer/node-1/api/json?depth=0',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_node_master(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'displayName': 'Built-In Node',
+                'offline': False,
+                'executors': [
+                    {
+                        'currentExecutable': {
+                            'url': 'https://example.com/job/example-job/1/',
+                            'timestamp': 1767975558000,
+                            'number': 1,
+                            'fullDisplayName': 'Example Job #1',
+                        }
+                    }
+                ],
+            }
+        )
+
+        assert jenkins.get_node(name='Built-In Node') == Node(
+            displayName='Built-In Node',
+            offline=False,
+            executors=[
+                NodeExecutor(
+                    currentExecutable=NodeExecutorCurrentExecutable(
+                        url='https://example.com/job/example-job/1/',
+                        timestamp=1767975558000,
+                        number=1,
+                        fullDisplayName='Example Job #1',
+                    )
+                )
+            ],
+        )
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/computer/(master)/api/json?depth=0',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_nodes(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'computer': [
+                    {
+                        'displayName': 'node-1',
+                        'offline': False,
+                        'executors': [],
+                    },
+                    {
+                        'displayName': 'Built-In Node',
+                        'offline': True,
+                        'executors': [],
+                    },
+                ]
+            }
+        )
+
+        assert jenkins.get_nodes() == [
+            Node(displayName='node-1', offline=False, executors=[]),
+            Node(displayName='Built-In Node', offline=True, executors=[]),
+        ]
+
+    def test_get_node_config(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(text='<node>config</node>')
+
+        assert jenkins.get_node_config(name='node-1') == '<node>config</node>'
+
+    def test_set_node_config(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(status_code=200)
+
+        assert jenkins.set_node_config(name='node-1', config_xml='<node>new config</node>') is None
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/computer/node-1/config.xml',
+            headers={
+                'Jenkins-Crumb': 'crumb-value',
+                'Content-Type': 'text/xml; charset=utf-8',
+            },
+            params=None,
+            data='<node>new config</node>',
+            timeout=75,
+        )
+
+
+class TestBuild:
+    def test_get_build(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'number': 2,
+                'url': 'https://example.com/job/example-job/2/',
+                'timestamp': 1767975558000,
+                'duration': 120000,
+                'estimatedDuration': 130000,
+                'building': False,
+                'result': 'SUCCESS',
+                'nextBuild': None,
+                'previousBuild': {
+                    'number': 1,
+                    'url': 'https://example.com/job/example-job/1/',
+                },
+            }
+        )
+
+        assert jenkins.get_build(fullname='example-job', number=1) == Build(
+            number=2,
+            url='https://example.com/job/example-job/2/',
+            timestamp=1767975558000,
+            duration=120000,
+            estimatedDuration=130000,
+            building=False,
+            result='SUCCESS',
+            nextBuild=None,
+            previousBuild=Build(
+                number=1,
+                url='https://example.com/job/example-job/1/',
+            ),
+        )
+
+    def _mock_console_lines(self, mock_session, mocker, lines: list[str]):
+        mock_response = mocker.Mock()
+        mock_response.iter_lines.return_value = iter(lines)
+        mock_session.get.return_value = mock_response
+        return mock_response
+
+    def test_get_build_console_output(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(mock_session, mocker, ['line1', 'line2', 'line3'])
+
+        assert jenkins.get_build_console_output(fullname='example-job', number=1) == 'line1\nline2\nline3'
+
+        mock_session.get.assert_called_once_with(
+            'https://example.com/job/example-job/1/consoleText',
+            timeout=jenkins.timeout,
+            stream=True,
+        )
+
+    def test_get_build_console_output_matrix_configuration(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(mock_session, mocker, ['line1'])
+
+        jenkins.get_build_console_output(fullname='matrix-job/jdk=17,label=linux', number=5)
+
+        mock_session.get.assert_called_once_with(
+            'https://example.com/job/matrix-job/jdk=17,label=linux/5/consoleText',
+            timeout=jenkins.timeout,
+            stream=True,
+        )
+
+    def test_get_build_console_output_with_pattern(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(
+            mock_session,
+            mocker,
+            ['ERROR: something failed', 'INFO: all good', 'ERROR: again'],
+        )
+
+        result = jenkins.get_build_console_output(fullname='example-job', number=1, pattern='ERROR')
+        assert result == 'ERROR: something failed\nERROR: again'
+
+    def test_get_build_console_output_with_offset(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(mock_session, mocker, ['line1', 'line2', 'line3', 'line4'])
+
+        result = jenkins.get_build_console_output(fullname='example-job', number=1, offset=2)
+        assert result == 'line3\nline4'
+
+    def test_get_build_console_output_with_limit(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(mock_session, mocker, ['line1', 'line2', 'line3', 'line4'])
+
+        result = jenkins.get_build_console_output(fullname='example-job', number=1, limit=2)
+        assert result == 'line1\nline2'
+
+    def test_get_build_console_output_with_offset_and_limit(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(mock_session, mocker, ['line1', 'line2', 'line3', 'line4', 'line5'])
+
+        result = jenkins.get_build_console_output(fullname='example-job', number=1, offset=1, limit=2)
+        assert result == 'line2\nline3'
+
+    def test_get_build_console_output_pattern_with_offset_and_limit(self, jenkins, mock_session, mocker):
+        self._mock_console_lines(
+            mock_session,
+            mocker,
+            ['ERROR: a', 'INFO: b', 'ERROR: c', 'ERROR: d', 'ERROR: e'],
+        )
+
+        # pattern filters to: ERROR:a, ERROR:c, ERROR:d, ERROR:e → offset=1 → c,d,e → limit=2 → c,d
+        result = jenkins.get_build_console_output(fullname='example-job', number=1, pattern='ERROR', offset=1, limit=2)
+        assert result == 'ERROR: c\nERROR: d'
+
+    def test_get_build_console_output_stops_early_on_limit(self, jenkins, mock_session, mocker):
+        """Verify response.close() is called when limit is reached mid-stream."""
+        mock_response = self._mock_console_lines(mock_session, mocker, ['a', 'b', 'c', 'd', 'e'])
+
+        jenkins.get_build_console_output(fullname='example-job', number=1, limit=2)
+        mock_response.close.assert_called_once()
+
+    def test_stop_build(self, jenkins, mock_session):
+        assert jenkins.stop_build(fullname='example-job', number=42) is None
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/42/stop',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_build_pending_inputs(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: [
+                {
+                    'id': 'Deploy',
+                    'message': 'Deploy to prod?',
+                    'proceedText': 'Deploy',
+                    'inputs': [{'name': 'TARGET', 'type': 'StringParameterDefinition'}],
+                    'proceedUrl': '/job/example-job/1/wfapi/inputSubmit?inputId=Deploy',
+                    'abortUrl': '/job/example-job/1/input/Deploy/abort',
+                    '_links': {'self': {'href': '/whatever'}},
+                }
+            ]
+        )
+
+        assert jenkins.get_build_pending_inputs(fullname='example-job', number=1) == [
+            PendingInput(
+                id='Deploy',
+                message='Deploy to prod?',
+                proceedText='Deploy',
+                inputs=[{'name': 'TARGET', 'type': 'StringParameterDefinition'}],
+            )
+        ]
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/job/example-job/1/wfapi/pendingInputActions',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_build_pending_inputs_empty(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: [])
+
+        assert jenkins.get_build_pending_inputs(fullname='example-job', number=1) == []
+
+    def test_get_build_pending_inputs_missing_endpoint(self, jenkins, mock_session, mocker):
+        response = mocker.Mock(status_code=404)
+        response.raise_for_status.side_effect = HTTPError(response=response)
+        mock_session.request.return_value = response
+
+        with pytest.raises(PendingInputsUnavailableError, match='pipeline-rest-api'):
+            jenkins.get_build_pending_inputs(fullname='example-job', number=1)
+
+    def test_get_build_pending_inputs_other_http_error(self, jenkins, mock_session, mocker):
+        response = mocker.Mock(status_code=500)
+        response.raise_for_status.side_effect = HTTPError(response=response)
+        mock_session.request.return_value = response
+
+        with pytest.raises(HTTPError):
+            jenkins.get_build_pending_inputs(fullname='example-job', number=1)
+
+    def test_get_build_pending_inputs_http_error_without_response(self, jenkins, mock_session):
+        mock_session.request.side_effect = HTTPError('Connection aborted')
+
+        with pytest.raises(HTTPError, match='Connection aborted'):
+            jenkins.get_build_pending_inputs(fullname='example-job', number=1)
+
+    def test_submit_build_input_proceed_with_parameters(self, jenkins, mock_session):
+        assert (
+            jenkins.submit_build_input(
+                fullname='example-job',
+                number=7,
+                input_id='Deploy',
+                action='proceed',
+                parameters={'APPROVE': True, 'TARGET': 'prod', 'COUNT': 3},
+            )
+            is None
+        )
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/7/input/Deploy/proceed',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data={
+                'json': (
+                    '{"parameter": [{"name": "APPROVE", "value": true}, '
+                    '{"name": "TARGET", "value": "prod"}, {"name": "COUNT", "value": 3}]}'
+                )
+            },
+            timeout=75,
+        )
+
+    def test_submit_build_input_proceed_without_parameters_still_sends_json(self, jenkins, mock_session):
+        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='proceed')
+
+        assert mock_session.request.call_args.kwargs['data'] == {'json': '{"parameter": []}'}
+
+    def test_submit_build_input_proceed_empty(self, jenkins, mock_session):
+        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='proceedEmpty')
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/7/input/Deploy/proceedEmpty',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_submit_build_input_abort(self, jenkins, mock_session):
+        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='abort')
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/7/input/Deploy/abort',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_submit_build_input_quotes_input_id(self, jenkins, mock_session):
+        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy to prod/now', action='abort')
+
+        assert (
+            mock_session.request.call_args.kwargs['url']
+            == 'https://example.com/job/example-job/7/input/Deploy%20to%20prod%2Fnow/abort'
+        )
+
+    def test_submit_build_input_in_folder(self, jenkins, mock_session):
+        jenkins.submit_build_input(fullname='folder/sub/example-job', number=7, input_id='Deploy', action='abort')
+
+        assert (
+            mock_session.request.call_args.kwargs['url']
+            == 'https://example.com/job/folder/job/sub/job/example-job/7/input/Deploy/abort'
+        )
+
+    def test_get_build_replay(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            text=(
+                '<textarea name="_.mainScript" checkMethod="post">main script code here</textarea>'
+                '<textarea name="_.additionalScripts" checkMethod="post">additional script code here</textarea>'
+                '<body>Foo</body>'
+            )
+        )
+
+        assert jenkins.get_build_replay(fullname='example-job', number=1) == BuildReplay(
+            scripts=['main script code here', 'additional script code here']
+        )
+
+    def test_get_build_parameters(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'actions': [
+                    {
+                        '_class': 'hudson.model.ParametersAction',
+                        'parameters': [
+                            {'name': 'BRANCH', 'value': 'main'},
+                            {'name': 'DEBUG', 'value': True},
+                        ],
+                    },
+                ]
+            }
+        )
+
+        assert jenkins.get_build_parameters(fullname='example-job', number=1) == {
+            'BRANCH': 'main',
+            'DEBUG': True,
+        }
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/job/example-job/1/api/json?tree=actions[parameters[name,value]]',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_build_parameters_no_params(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {'actions': []})
+
+        assert jenkins.get_build_parameters(fullname='example-job', number=1) == {}
+
+    def test_get_build_test_report(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'suites': [
+                    {
+                        'name': 'Example Suite',
+                        'cases': [
+                            {
+                                'name': 'test_case_1',
+                                'className': 'ExampleTest',
+                                'status': 'PASSED',
+                            },
+                            {
+                                'name': 'test_case_2',
+                                'className': 'ExampleTest',
+                                'status': 'FAILED',
+                                'errorDetails': 'AssertionError: expected X but got Y',
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+        assert jenkins.get_build_test_report(fullname='example-job', number=1) == {
+            'suites': [
+                {
+                    'name': 'Example Suite',
+                    'cases': [
+                        {
+                            'name': 'test_case_1',
+                            'className': 'ExampleTest',
+                            'status': 'PASSED',
+                        },
+                        {
+                            'name': 'test_case_2',
+                            'className': 'ExampleTest',
+                            'status': 'FAILED',
+                            'errorDetails': 'AssertionError: expected X but got Y',
+                        },
+                    ],
+                }
+            ]
+        }
+
+    def test_get_build_test_failures(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                '_class': 'hudson.tasks.junit.TestResult',
+                'failCount': 2,
+                'passCount': 1,
+                'skipCount': 0,
+                'suites': [
+                    {
+                        'name': 'Example Suite',
+                        'cases': [
+                            {'className': 'ExampleTest', 'name': 'test_pass', 'status': 'PASSED', 'errorDetails': None},
+                            {
+                                'className': 'ExampleTest',
+                                'name': 'test_fail',
+                                'status': 'FAILED',
+                                'age': 1,
+                                'errorDetails': 'AssertionError',
+                                'errorStackTrace': 'x' * 10,
+                            },
+                            {'className': 'ExampleTest', 'name': 'test_regression', 'status': 'REGRESSION'},
+                        ],
+                    }
+                ],
+            }
+        )
+
+        assert jenkins.get_build_test_failures(fullname='example-job', number=1, max_stack_trace_length=4) == {
+            'failCount': 2,
+            'passCount': 1,
+            'skipCount': 0,
+            'truncated': False,
+            'failures': [
+                {
+                    'className': 'ExampleTest',
+                    'name': 'test_fail',
+                    'status': 'FAILED',
+                    'age': 1,
+                    'errorDetails': 'AssertionError',
+                    'errorStackTrace': 'xxxx... (truncated)',
+                    'suite': 'Example Suite',
+                },
+                {
+                    'className': 'ExampleTest',
+                    'name': 'test_regression',
+                    'status': 'REGRESSION',
+                    'suite': 'Example Suite',
+                },
+            ],
+        }
+
+        url = mock_session.request.call_args.kwargs['url']
+        assert url.startswith('https://example.com/job/example-job/1/testReport/api/json?tree=')
+        assert 'childReports[' in url
+
+    def test_get_build_test_failures_matrix(self, jenkins, mock_session, mocker):
+        def child_report(url: str, failing: str) -> dict:
+            return {
+                'child': {'url': url},
+                'result': {
+                    'suites': [
+                        {
+                            'name': 'Suite',
+                            'cases': [
+                                {'className': 'T', 'name': 'ok', 'status': 'FIXED'},
+                                {'className': 'T', 'name': failing, 'status': 'FAILED'},
+                            ],
+                        }
+                    ]
+                },
+            }
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                '_class': 'hudson.tasks.test.MatrixTestResult',
+                'failCount': 2,
+                'skipCount': 0,
+                'totalCount': 4,
+                'childReports': [
+                    child_report('https://example.com/job/m/a=1/3/', 'first'),
+                    child_report('https://example.com/job/m/a=2/3/', 'second'),
+                ],
+            }
+        )
+
+        assert jenkins.get_build_test_failures(fullname='m', number=3, limit=1) == {
+            'failCount': 2,
+            'skipCount': 0,
+            'totalCount': 4,
+            'truncated': True,
+            'failures': [
+                {
+                    'className': 'T',
+                    'name': 'first',
+                    'status': 'FAILED',
+                    'suite': 'Suite',
+                    'build_url': 'https://example.com/job/m/a=1/3/',
+                },
+            ],
+        }
+
+    def test_get_running_builds(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'computer': [
+                    {
+                        'displayName': 'node-1',
+                        'offline': False,
+                        'executors': [
+                            {
+                                'currentExecutable': {
+                                    'number': 3,
+                                    'url': 'https://example.com/job/example-job/3/',
+                                    'timestamp': 1767975558000,
+                                    'fullDisplayName': 'Example Job #3',
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        assert jenkins.get_running_builds() == [
+            Build(
+                url='https://example.com/job/example-job/3/',
+                number=3,
+                timestamp=1767975558000,
+            )
+        ]
+
+    def test_get_build_artifacts(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'artifacts': [
+                    {
+                        'fileName': 'index.html',
+                        'relativePath': 'playwright-report/index.html',
+                        'displayPath': 'playwright-report/index.html',
+                    },
+                    {
+                        'fileName': 'trace.zip',
+                        'relativePath': 'trace.zip',
+                        'displayPath': 'trace.zip',
+                    },
+                ]
+            }
+        )
+
+        assert jenkins.get_build_artifacts(fullname='example-job', number=1) == [
+            Artifact(
+                fileName='index.html',
+                relativePath='playwright-report/index.html',
+                displayPath='playwright-report/index.html',
+            ),
+            Artifact(fileName='trace.zip', relativePath='trace.zip', displayPath='trace.zip'),
+        ]
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/job/example-job/1/api/json?tree=artifacts[fileName,relativePath,displayPath]',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_build_artifacts_empty(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {'artifacts': []})
+
+        assert jenkins.get_build_artifacts(fullname='example-job', number=1) == []
+
+    def test_get_build_artifact(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(content=b'<html>report</html>')
+
+        result = jenkins.get_build_artifact(
+            fullname='example-job', number=1, relative_path='playwright-report/index.html'
+        )
+        assert result == b'<html>report</html>'
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/job/example-job/1/artifact/playwright-report/index.html',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_build_artifact_binary(self, jenkins, mock_session, mocker):
+        binary_content = bytes(range(256))
+        mock_session.request.return_value = mocker.Mock(content=binary_content)
+
+        result = jenkins.get_build_artifact(fullname='example-job', number=1, relative_path='trace.zip')
+        assert result == binary_content
+
+    def test_get_build_artifact_url(self, jenkins):
+        url = jenkins.get_build_artifact_url(
+            fullname='example-job', number=1, relative_path='playwright-report/index.html'
+        )
+        assert url == 'https://example.com/job/example-job/1/artifact/playwright-report/index.html'
+
+    def test_get_build_artifact_url_nested_job(self, jenkins):
+        url = jenkins.get_build_artifact_url(fullname='folder/example-job', number=42, relative_path='trace.zip')
+        assert url == 'https://example.com/job/folder/job/example-job/42/artifact/trace.zip'
+
+
+class TestItem:
+    def test_get_items(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'jobs': [
+                    {
+                        'name': 'example-job',
+                        'url': 'https://example.com/job/example-job/',
+                        '_class': 'hudson.model.WorkflowJob',
+                        'color': 'blue',
+                        'fullName': 'example-job',
+                    },
+                    {
+                        'name': 'example-folder',
+                        'url': 'https://example.com/job/example-folder/',
+                        '_class': 'com.cloudbees.hudson.plugins.folder.Folder',
+                        'fullName': 'example-folder',
+                        'jobs': [
+                            {
+                                'name': 'nested-job',
+                                'url': 'https://example.com/job/example-folder/job/nested-job/',
+                                '_class': 'hudson.model.FreeStyleProject',
+                                'color': 'red',
+                                'fullname': 'example-folder',
+                            },
+                            {
+                                'name': 'nested-multibranch',
+                                'url': 'https://example.com/job/example-folder/job/nested-multibranch',
+                                '_class': 'org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject',
+                                'fullname': 'example-multibranch',
+                                'jobs': [
+                                    {
+                                        'name': 'example-job',
+                                        'url': 'https://example.com/job/example-folder/job/nested-multibranch/job/example-job/',
+                                        '_class': 'hudson.model.WorkflowJob',
+                                        'color': 'blue',
+                                        'fullname': 'example-multibranch/job/example-job',
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ]
+            }
+        )
+
+        assert jenkins.get_items() == [
+            Job(
+                class_='hudson.model.WorkflowJob',
+                name='example-job',
+                url='https://example.com/job/example-job/',
+                fullname='example-job',
+                color='blue',
+            ),
+            Folder(
+                class_='com.cloudbees.hudson.plugins.folder.Folder',
+                name='example-folder',
+                url='https://example.com/job/example-folder/',
+                fullname='example-folder',
+                jobs=[
+                    FreeStyleProject(
+                        class_='hudson.model.FreeStyleProject',
+                        name='nested-job',
+                        url='https://example.com/job/example-folder/job/nested-job/',
+                        fullname='example-folder',
+                        color='red',
+                    ),
+                    MultiBranchProject(
+                        class_='org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject',
+                        name='nested-multibranch',
+                        url='https://example.com/job/example-folder/job/nested-multibranch',
+                        fullname='example-multibranch',
+                        jobs=[
+                            Job(
+                                class_='hudson.model.WorkflowJob',
+                                name='example-job',
+                                url='https://example.com/job/example-folder/job/nested-multibranch/job/example-job/',
+                                fullname='example-multibranch/job/example-job',
+                                color='blue',
+                            )
+                        ],
+                    ),
+                ],
+            ),
+            FreeStyleProject(
+                class_='hudson.model.FreeStyleProject',
+                name='nested-job',
+                url='https://example.com/job/example-folder/job/nested-job/',
+                fullname='example-folder',
+                color='red',
+            ),
+            MultiBranchProject(
+                class_='org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject',
+                name='nested-multibranch',
+                url='https://example.com/job/example-folder/job/nested-multibranch',
+                fullname='example-multibranch',
+                jobs=[
+                    Job(
+                        class_='hudson.model.WorkflowJob',
+                        name='example-job',
+                        url='https://example.com/job/example-folder/job/nested-multibranch/job/example-job/',
+                        fullname='example-multibranch/job/example-job',
+                        color='blue',
+                    )
+                ],
+            ),
+            Job(
+                class_='hudson.model.WorkflowJob',
+                name='example-job',
+                url='https://example.com/job/example-folder/job/nested-multibranch/job/example-job/',
+                fullname='example-multibranch/job/example-job',
+                color='blue',
+            ),
+        ]
+
+    def test_get_item(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'name': 'example-folder',
+                'url': 'https://example.com/job/example-folder/',
+                '_class': 'com.cloudbees.hudson.plugins.folder.Folder',
+                'fullName': 'example-folder',
+                'jobs': [
+                    {
+                        'name': 'nested-job',
+                        'url': 'https://example.com/job/example-folder/job/nested-job/',
+                        '_class': 'hudson.model.WorkflowJob',
+                        'color': 'red',
+                        'fullname': 'example-folder/example-job',
+                    }
+                ],
+            }
+        )
+
+        assert jenkins.get_item(fullname='example-folder') == Folder(
+            class_='com.cloudbees.hudson.plugins.folder.Folder',
+            name='example-folder',
+            url='https://example.com/job/example-folder/',
+            fullname='example-folder',
+            jobs=[
+                Job(
+                    class_='hudson.model.WorkflowJob',
+                    name='nested-job',
+                    url='https://example.com/job/example-folder/job/nested-job/',
+                    fullname='example-folder/example-job',
+                    color='red',
+                )
+            ],
+        )
+
+    def test_get_last_build_number(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {'buildable': True, 'lastBuild': {'number': 42}})
+
+        assert jenkins.get_last_build_number(fullname='example-job') == 42
+
+        mock_session.request.assert_called_once_with(
+            method='GET',
+            url='https://example.com/job/example-job/api/json?tree=lastBuild[number],buildable',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data=None,
+            timeout=75,
+        )
+
+    def test_get_last_build_number_never_built(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {'buildable': True, 'lastBuild': None})
+
+        assert jenkins.get_last_build_number(fullname='example-job') is None
+
+    def test_get_last_build_number_never_built_without_last_build_key(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {'buildable': True})
+
+        assert jenkins.get_last_build_number(fullname='example-job') is None
+
+    def test_get_last_build_number_item_without_builds(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(json=lambda: {})
+
+        with pytest.raises(ValueError, match='cannot have builds'):
+            jenkins.get_last_build_number(fullname='example-folder')
+
+    def test_get_item_config(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(text='<project>config</project>')
+
+        assert jenkins.get_item_config(fullname='example-job') == '<project>config</project>'
+
+    def test_set_item_config(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(status_code=200)
+
+        assert jenkins.set_item_config(fullname='example-job', config_xml='<project>new config</project>') is None
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/config.xml',
+            headers={
+                'Jenkins-Crumb': 'crumb-value',
+                'Content-Type': 'text/xml; charset=utf-8',
+            },
+            params=None,
+            data='<project>new config</project>',
+            timeout=75,
+        )
+
+    def test_query_items(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'jobs': [
+                    {
+                        'name': 'example-job',
+                        'url': 'https://example.com/job/example-job/',
+                        '_class': 'hudson.model.WorkflowJob',
+                        'color': 'blue',
+                        'fullName': 'example-job',
+                    },
+                    {
+                        'name': 'another-job',
+                        'url': 'https://example.com/job/another-job/',
+                        '_class': 'hudson.model.FreeStyleProject',
+                        'color': 'red',
+                        'fullName': 'another-job',
+                    },
+                ]
+            }
+        )
+
+        assert jenkins.query_items(
+            class_pattern='.*WorkflowJob',
+        ) == [
+            Job(
+                class_='hudson.model.WorkflowJob',
+                name='example-job',
+                url='https://example.com/job/example-job/',
+                fullname='example-job',
+                color='blue',
+            )
+        ]
+
+        assert jenkins.query_items(
+            color_pattern='red',
+        ) == [
+            FreeStyleProject(
+                class_='hudson.model.FreeStyleProject',
+                name='another-job',
+                url='https://example.com/job/another-job/',
+                fullname='another-job',
+                color='red',
+            )
+        ]
+
+        assert jenkins.query_items(fullname_pattern='example') == [
+            Job(
+                class_='hudson.model.WorkflowJob',
+                name='example-job',
+                url='https://example.com/job/example-job/',
+                fullname='example-job',
+                color='blue',
+            )
+        ]
+
+    def test_build_item(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            status_code=201, headers={'Location': 'https://example.com/queue/item/123/'}
+        )
+
+        assert (
+            jenkins.build_item(
+                fullname='example-job',
+                build_type='buildWithParameters',
+                data={'param1': 'value1'},
+            )
+            == 123
+        )
+
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/job/example-job/buildWithParameters',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            params=None,
+            data={'param1': 'value1'},
+            timeout=75,
+        )
+
+
+class TestPlugin:
+    def test_get_plugins(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0', 'enabled': True},
+                    {'shortName': 'plugin-b', 'version': '2.0', 'enabled': False},
+                ]
+            }
+        )
+
+        assert jenkins.get_plugins(depth=0) == [
+            {'shortName': 'plugin-a', 'version': '1.0', 'enabled': True},
+            {'shortName': 'plugin-b', 'version': '2.0', 'enabled': False},
+        ]
+
+    def test_get_plugin_found(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0'},
+                    {'shortName': 'plugin-b', 'version': '2.0'},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugin(short_name='plugin-b')
+        assert result == {'shortName': 'plugin-b', 'version': '2.0'}
+
+    def test_get_plugin_not_found(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0'},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugin(short_name='nonexistent')
+        assert result is None
+
+    def test_get_plugins_with_problems(self, jenkins, mock_session, mocker):
+        pass
+
+    def test_get_plugins_with_problems_missing_dependency(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': True,
+                        'dependencies': [
+                            {'shortName': 'missing-dep', 'version': '1.0', 'optional': False, 'bundled': False},
+                        ],
+                    },
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        missing_dep = next((p for p in problems if p['problem'] == 'missing_dependency'), None)
+        assert missing_dep is not None
+        assert missing_dep['dependency'] == 'missing-dep'
+
+    def test_get_plugins_with_problems_optional_dependency_ignored(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': True,
+                        'dependencies': [
+                            {'shortName': 'optional-dep', 'version': '1.0', 'optional': True, 'bundled': False},
+                        ],
+                    },
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        missing_optional = next((p for p in problems if p['problem'] == 'missing_optional_dependency'), None)
+        assert missing_optional is not None
+
+    def test_get_plugins_with_problems_version_mismatch(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': True,
+                        'dependencies': [
+                            {'shortName': 'dep-plugin', 'version': '2.0', 'optional': False, 'bundled': False},
+                        ],
+                    },
+                    {'shortName': 'dep-plugin', 'version': '1.5'},
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        version_issue = next((p for p in problems if p['problem'] == 'version_mismatch'), None)
+        assert version_issue is not None
+
+    def test_get_plugins_with_problems_installed_version_higher_no_issue(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': True,
+                        'dependencies': [
+                            {'shortName': 'dep-plugin', 'version': '1.0', 'optional': False, 'bundled': False},
+                        ],
+                    },
+                    {'shortName': 'dep-plugin', 'version': '2.0'},
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        version_issue = next((p for p in problems if p['problem'] == 'version_mismatch'), None)
+        assert version_issue is None
+
+    def test_get_plugins_with_updates(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0', 'hasUpdate': True},
+                    {'shortName': 'plugin-b', 'version': '2.0', 'hasUpdate': False},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugins_with_updates()
+        assert len(result) == 1
+        assert result[0]['shortName'] == 'plugin-a'
+
+    def test_get_plugins_with_backup(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0', 'backupVersion': '0.9', 'downgradable': True},
+                    {'shortName': 'plugin-b', 'version': '2.0'},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugins_with_backup()
+        assert len(result) == 1
+        assert result[0]['shortName'] == 'plugin-a'
+        assert result[0]['backupVersion'] == '0.9'
+
+    def test_get_plugin_dependency_graph(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'dependencies': [
+                            {'shortName': 'plugin-b', 'version': '1.0', 'optional': False},
+                            {'shortName': 'plugin-c', 'version': '1.0', 'optional': True},
+                        ],
+                    },
+                    {
+                        'shortName': 'plugin-b',
+                        'version': '1.0',
+                        'dependencies': [],
+                    },
+                    {'shortName': 'plugin-c', 'version': '1.0', 'dependencies': []},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugin_dependency_graph('plugin-a')
+        assert 'nodes' in result
+        assert 'edges' in result
+        assert len(result['nodes']) == 3
+        assert len(result['edges']) == 2
+
+    def test_get_plugin_dependency_graph_not_found(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {'shortName': 'plugin-a', 'version': '1.0', 'dependencies': []},
+                ]
+            }
+        )
+
+        result = jenkins.get_plugin_dependency_graph('nonexistent')
+        assert 'error' in result
+        assert result['error'] == 'Plugin not found: nonexistent'
+
+    def test_get_plugins_with_problems_disabled_plugin(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': False,
+                        'dependencies': [],
+                    },
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        disabled = next((p for p in problems if p['problem'] == 'plugin_disabled'), None)
+        assert disabled is not None
+        assert disabled['shortName'] == 'plugin-a'
+
+    def test_get_plugins_with_problems_optional_version_mismatch(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'version': '2.479.3',
+            }
+        )
+        mock_session.request.return_value.headers = {'X-Jenkins': '2.479.3'}
+
+        mock_session.request.return_value = mocker.Mock(
+            json=lambda: {
+                'plugins': [
+                    {
+                        'shortName': 'plugin-a',
+                        'version': '1.0',
+                        'enabled': True,
+                        'dependencies': [
+                            {'shortName': 'optional-dep', 'version': '2.0', 'optional': True, 'bundled': False},
+                        ],
+                    },
+                    {'shortName': 'optional-dep', 'version': '1.5'},
+                ]
+            }
+        )
+
+        problems = jenkins.get_plugins_with_problems()
+        version_issue = next((p for p in problems if p['problem'] == 'version_mismatch_optional'), None)
+        assert version_issue is not None
+        assert version_issue['dependency'] == 'optional-dep'
+
+    def test_run_script(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(text='Result: script output', raise_for_status=mocker.Mock())
+
+        result = jenkins.run_script('println("test")')
+
+        assert result == 'script output'
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/scriptText',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            data={'script': b'println("test")'},
+            params=None,
+            timeout=75,
+        )
+
+    def test_run_script_without_result_prefix(self, jenkins, mock_session, mocker):
+        mock_session.request.return_value = mocker.Mock(text='direct output', raise_for_status=mocker.Mock())
+
+        result = jenkins.run_script('return "direct"')
+
+        assert result == 'direct output'
+        mock_session.request.assert_called_once_with(
+            method='POST',
+            url='https://example.com/scriptText',
+            headers={'Jenkins-Crumb': 'crumb-value'},
+            data={'script': b'return "direct"'},
+            params=None,
+            timeout=75,
+        )

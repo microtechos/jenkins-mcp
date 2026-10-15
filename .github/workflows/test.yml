@@ -1,0 +1,43 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - src/**
+      - pyproject.toml
+      - tests/**
+  pull_request:
+    branches: [ master ]
+    paths:
+      - src/**
+      - pyproject.toml
+      - tests/**
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      - name: Run tests
+        # For example, using `pytest`
+        run: uv run pytest --cov=mcp_jenkins --cov-branch --cov-report=xml
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
