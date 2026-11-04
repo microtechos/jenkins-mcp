@@ -23,25 +23,6 @@ def test_main_stdio(mocker):
     mock_mcp.run_async.assert_called_once_with(transport='stdio')
 
 
-def test_main_sse(mocker):
-    mocker.patch('mcp_jenkins.asyncio')
-    mock_mcp = mocker.patch('mcp_jenkins.server.mcp')
-
-    CliRunner().invoke(main, ['--transport', 'sse', '--host', '127.0.0.1', '--port', '9887'])
-    mock_mcp.run_async.assert_called_once_with(transport='sse', host='127.0.0.1', port=9887)
-
-
-def test_main_streamable_http(mocker):
-    mocker.patch('mcp_jenkins.asyncio')
-    mock_mcp = mocker.patch('mcp_jenkins.server.mcp')
-
-    CliRunner().invoke(
-        main,
-        ['--transport', 'streamable-http', '--host', '127.0.0.1', '--port', '9887'],
-    )
-    mock_mcp.run_async.assert_called_once_with(transport='streamable-http', host='127.0.0.1', port=9887)
-
-
 def test_main(mocker):
     mocker.patch('mcp_jenkins.asyncio')
     mock_mcp = mocker.patch('mcp_jenkins.server.mcp')
@@ -132,7 +113,7 @@ def test_main_env_file_missing_path(mocker):
     assert result.exit_code != 0
 
 
-def test_main_env_file_autodiscovery(mocker, monkeypatch, tmp_path):
+def test_main_env_file_not_autodiscovered(mocker, monkeypatch, tmp_path):
     mocker.patch('mcp_jenkins.asyncio')
     mocker.patch('mcp_jenkins.server.mcp')
 
@@ -149,6 +130,36 @@ def test_main_env_file_autodiscovery(mocker, monkeypatch, tmp_path):
     result = CliRunner().invoke(main, ['--transport', 'stdio'])
 
     assert result.exit_code == 0
-    assert os.environ['jenkins_url'] == 'https://auto.example.com'
-    assert os.environ['jenkins_username'] == 'auto-username'
-    assert os.environ['jenkins_password'] == 'auto-password'
+    assert 'jenkins_url' not in os.environ
+    assert 'jenkins_username' not in os.environ
+    assert 'jenkins_password' not in os.environ
+
+
+def test_main_rejects_network_transports(mocker):
+    mocker.patch('mcp_jenkins.asyncio')
+    mocker.patch('mcp_jenkins.server.mcp')
+
+    for transport in ('sse', 'streamable-http'):
+        result = CliRunner().invoke(main, ['--transport', transport])
+        assert result.exit_code != 0
+
+
+def test_main_accepts_deprecated_read_only_flag(mocker):
+    mocker.patch('mcp_jenkins.asyncio')
+    mock_mcp = mocker.patch('mcp_jenkins.server.mcp')
+
+    result = CliRunner().invoke(main, ['--transport', 'stdio', '--read-only'])
+
+    assert result.exit_code == 0
+    mock_mcp.run_async.assert_called_once_with(transport='stdio')
+
+
+def test_main_allowed_folders(mocker, monkeypatch):
+    mocker.patch('mcp_jenkins.asyncio')
+    mocker.patch('mcp_jenkins.server.mcp')
+    monkeypatch.delenv('JENKINS_ALLOWED_FOLDERS', raising=False)
+
+    result = CliRunner().invoke(main, ['--allowed-folders', 'Branch-Retail,Branch-Salon'])
+
+    assert result.exit_code == 0
+    assert os.environ['jenkins_allowed_folders'] == 'Branch-Retail,Branch-Salon'

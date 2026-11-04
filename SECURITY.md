@@ -1,21 +1,21 @@
 # Security Policy
 
-## Supported Versions
+This is Microtech's read-only fork of `lanbaoshen/mcp-jenkins`.
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+Only the latest tag of this fork is supported.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Do not open a public issue. Report it privately to the Microtech dev team (the maintainers of the
+`microtech-jenkins` plugin in `microtechos/claude-ai-agent-system`) with the affected version, how to
+reproduce it and the impact. Expect an acknowledgement within a few working days.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+## Design rules that must not regress
+
+- No tool sends a non-GET request to Jenkins and no tool runs scripts.
+- Only stdio is supported; no network listener.
+- The Jenkins URL and credentials come only from the server's own configuration.
+- Job names, node names and artifact paths are validated and URL-quoted before use.
+- Output is size-capped, and `get_item_config` redacts secret-looking values.

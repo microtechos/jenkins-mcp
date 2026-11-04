@@ -404,18 +404,6 @@ class TestQueue:
             ),
         )
 
-    def test_cancel_queue_item(self, jenkins, mock_session):
-        assert jenkins.cancel_queue_item(id=42) is None
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/queue/cancelItem?id=42',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data=None,
-            timeout=75,
-        )
-
-
 class TestNode:
     def test_get_node(self, jenkins, mock_session, mocker):
         mock_session.request.return_value = mocker.Mock(
@@ -523,29 +511,6 @@ class TestNode:
             Node(displayName='node-1', offline=False, executors=[]),
             Node(displayName='Built-In Node', offline=True, executors=[]),
         ]
-
-    def test_get_node_config(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(text='<node>config</node>')
-
-        assert jenkins.get_node_config(name='node-1') == '<node>config</node>'
-
-    def test_set_node_config(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(status_code=200)
-
-        assert jenkins.set_node_config(name='node-1', config_xml='<node>new config</node>') is None
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/computer/node-1/config.xml',
-            headers={
-                'Jenkins-Crumb': 'crumb-value',
-                'Content-Type': 'text/xml; charset=utf-8',
-            },
-            params=None,
-            data='<node>new config</node>',
-            timeout=75,
-        )
-
 
 class TestBuild:
     def test_get_build(self, jenkins, mock_session, mocker):
@@ -655,18 +620,6 @@ class TestBuild:
         jenkins.get_build_console_output(fullname='example-job', number=1, limit=2)
         mock_response.close.assert_called_once()
 
-    def test_stop_build(self, jenkins, mock_session):
-        assert jenkins.stop_build(fullname='example-job', number=42) is None
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/42/stop',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data=None,
-            timeout=75,
-        )
-
     def test_get_build_pending_inputs(self, jenkins, mock_session, mocker):
         mock_session.request.return_value = mocker.Mock(
             json=lambda: [
@@ -726,77 +679,6 @@ class TestBuild:
 
         with pytest.raises(HTTPError, match='Connection aborted'):
             jenkins.get_build_pending_inputs(fullname='example-job', number=1)
-
-    def test_submit_build_input_proceed_with_parameters(self, jenkins, mock_session):
-        assert (
-            jenkins.submit_build_input(
-                fullname='example-job',
-                number=7,
-                input_id='Deploy',
-                action='proceed',
-                parameters={'APPROVE': True, 'TARGET': 'prod', 'COUNT': 3},
-            )
-            is None
-        )
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/7/input/Deploy/proceed',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data={
-                'json': (
-                    '{"parameter": [{"name": "APPROVE", "value": true}, '
-                    '{"name": "TARGET", "value": "prod"}, {"name": "COUNT", "value": 3}]}'
-                )
-            },
-            timeout=75,
-        )
-
-    def test_submit_build_input_proceed_without_parameters_still_sends_json(self, jenkins, mock_session):
-        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='proceed')
-
-        assert mock_session.request.call_args.kwargs['data'] == {'json': '{"parameter": []}'}
-
-    def test_submit_build_input_proceed_empty(self, jenkins, mock_session):
-        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='proceedEmpty')
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/7/input/Deploy/proceedEmpty',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data=None,
-            timeout=75,
-        )
-
-    def test_submit_build_input_abort(self, jenkins, mock_session):
-        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy', action='abort')
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/7/input/Deploy/abort',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data=None,
-            timeout=75,
-        )
-
-    def test_submit_build_input_quotes_input_id(self, jenkins, mock_session):
-        jenkins.submit_build_input(fullname='example-job', number=7, input_id='Deploy to prod/now', action='abort')
-
-        assert (
-            mock_session.request.call_args.kwargs['url']
-            == 'https://example.com/job/example-job/7/input/Deploy%20to%20prod%2Fnow/abort'
-        )
-
-    def test_submit_build_input_in_folder(self, jenkins, mock_session):
-        jenkins.submit_build_input(fullname='folder/sub/example-job', number=7, input_id='Deploy', action='abort')
-
-        assert (
-            mock_session.request.call_args.kwargs['url']
-            == 'https://example.com/job/folder/job/sub/job/example-job/7/input/Deploy/abort'
-        )
 
     def test_get_build_replay(self, jenkins, mock_session, mocker):
         mock_session.request.return_value = mocker.Mock(
@@ -1063,7 +945,9 @@ class TestBuild:
         assert jenkins.get_build_artifacts(fullname='example-job', number=1) == []
 
     def test_get_build_artifact(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(content=b'<html>report</html>')
+        mock_session.request.return_value = mocker.Mock(
+            headers={'Content-Length': '19'}, iter_content=lambda chunk_size: [b'<html>report</html>']
+        )
 
         result = jenkins.get_build_artifact(
             fullname='example-job', number=1, relative_path='playwright-report/index.html'
@@ -1077,11 +961,14 @@ class TestBuild:
             params=None,
             data=None,
             timeout=75,
+            stream=True,
         )
 
     def test_get_build_artifact_binary(self, jenkins, mock_session, mocker):
         binary_content = bytes(range(256))
-        mock_session.request.return_value = mocker.Mock(content=binary_content)
+        mock_session.request.return_value = mocker.Mock(
+            headers={}, iter_content=lambda chunk_size: [binary_content[:100], binary_content[100:]]
+        )
 
         result = jenkins.get_build_artifact(fullname='example-job', number=1, relative_path='trace.zip')
         assert result == binary_content
@@ -1282,23 +1169,6 @@ class TestItem:
 
         assert jenkins.get_item_config(fullname='example-job') == '<project>config</project>'
 
-    def test_set_item_config(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(status_code=200)
-
-        assert jenkins.set_item_config(fullname='example-job', config_xml='<project>new config</project>') is None
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/config.xml',
-            headers={
-                'Jenkins-Crumb': 'crumb-value',
-                'Content-Type': 'text/xml; charset=utf-8',
-            },
-            params=None,
-            data='<project>new config</project>',
-            timeout=75,
-        )
-
     def test_query_items(self, jenkins, mock_session, mocker):
         mock_session.request.return_value = mocker.Mock(
             json=lambda: {
@@ -1354,30 +1224,6 @@ class TestItem:
                 color='blue',
             )
         ]
-
-    def test_build_item(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(
-            status_code=201, headers={'Location': 'https://example.com/queue/item/123/'}
-        )
-
-        assert (
-            jenkins.build_item(
-                fullname='example-job',
-                build_type='buildWithParameters',
-                data={'param1': 'value1'},
-            )
-            == 123
-        )
-
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/job/example-job/buildWithParameters',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            params=None,
-            data={'param1': 'value1'},
-            timeout=75,
-        )
-
 
 class TestPlugin:
     def test_get_plugins(self, jenkins, mock_session, mocker):
@@ -1658,33 +1504,3 @@ class TestPlugin:
         version_issue = next((p for p in problems if p['problem'] == 'version_mismatch_optional'), None)
         assert version_issue is not None
         assert version_issue['dependency'] == 'optional-dep'
-
-    def test_run_script(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(text='Result: script output', raise_for_status=mocker.Mock())
-
-        result = jenkins.run_script('println("test")')
-
-        assert result == 'script output'
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/scriptText',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            data={'script': b'println("test")'},
-            params=None,
-            timeout=75,
-        )
-
-    def test_run_script_without_result_prefix(self, jenkins, mock_session, mocker):
-        mock_session.request.return_value = mocker.Mock(text='direct output', raise_for_status=mocker.Mock())
-
-        result = jenkins.run_script('return "direct"')
-
-        assert result == 'direct output'
-        mock_session.request.assert_called_once_with(
-            method='POST',
-            url='https://example.com/scriptText',
-            headers={'Jenkins-Crumb': 'crumb-value'},
-            data={'script': b'return "direct"'},
-            params=None,
-            timeout=75,
-        )

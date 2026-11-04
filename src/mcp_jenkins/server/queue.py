@@ -27,12 +27,3 @@ async def get_queue_item(ctx: Context, id: int) -> dict:
     item = jenkins(ctx).get_queue_item(id=id, depth=1)
     return item.model_dump(exclude_none=True)
 
-
-@mcp.tool(tags=['write'])
-async def cancel_queue_item(ctx: Context, id: int) -> None:
-    """Cancel a specific item in Jenkins queue by id
-
-    Args:
-        id: The id of the queue item
-    """
-    jenkins(ctx).cancel_queue_item(id=id)

@@ -1,9 +1,9 @@
 import xml.etree.ElementTree as ET
-from typing import Literal
 
 from fastmcp import Context
 
 from mcp_jenkins.core.lifespan import jenkins
+from mcp_jenkins.jenkins.redact import redact_config_xml
 from mcp_jenkins.server import mcp
 
 
@@ -34,24 +34,16 @@ async def get_item(ctx: Context, fullname: str) -> dict:
 async def get_item_config(ctx: Context, fullname: str) -> str:
     """Get specific item config from Jenkins
 
+    Secret-looking values (encrypted secrets, password/token elements, inline NAME=value assignments for
+    password/token/secret/key variables) are replaced with [REDACTED]. Credential ids are kept.
+
     Args:
         fullname: The fullname of the item
 
     Returns:
-        The config of the item
+        The config of the item, with secrets redacted
     """
-    return jenkins(ctx).get_item_config(fullname=fullname)
-
-
-@mcp.tool(tags=['write'])
-async def set_item_config(ctx: Context, fullname: str, config_xml: str) -> None:
-    """Set specific item config in Jenkins
-
-    Args:
-        fullname: The fullname of the item
-        config_xml: The config XML of the item
-    """
-    jenkins(ctx).set_item_config(fullname=fullname, config_xml=config_xml)
+    return redact_config_xml(jenkins(ctx).get_item_config(fullname=fullname))
 
 
 @mcp.tool(tags=['read'])
@@ -82,26 +74,6 @@ async def query_items(
             folder_depth=folder_depth,
         )
     ]
-
-
-@mcp.tool(tags=['write'])
-async def build_item(
-    ctx: Context,
-    fullname: str,
-    build_type: Literal['build', 'buildWithParameters'],
-    data: dict | None = None,
-) -> int:
-    """Build an item in Jenkins
-
-    Args:
-        fullname: The fullname of the item
-        data: The parameters to trigger the build with. Required if build_type is 'buildWithParameters'.
-        build_type: If your item is configured with parameters, you must use 'buildWithParameters' as build_type.
-
-    Returns:
-        The queue item number of the item.
-    """
-    return jenkins(ctx).build_item(fullname=fullname, build_type=build_type, data=data)
 
 
 @mcp.tool(tags=['read'])

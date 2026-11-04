@@ -1,4 +1,3 @@
-import json
 import re
 from functools import reduce
 from typing import Literal
@@ -35,6 +34,13 @@ class PendingInputsUnavailableError(ValueError):
 class Jenkins:
     DEFAULT_HEADERS = {'Content-Type': 'text/xml; charset=utf-8'}
 
+    # Output caps: a single tool call can not pull an unbounded log or file into the model's context.
+    MAX_CONSOLE_LINES = 5000
+    MAX_CONSOLE_SCAN_LINES = 500_000
+    MAX_CONSOLE_LINE_CHARS = 2000
+    MAX_PATTERN_LENGTH = 200
+    MAX_ARTIFACT_BYTES = 5 * 1024 * 1024
+
     def __init__(
         self,
         *,
@@ -43,8 +49,10 @@ class Jenkins:
         password: str | None = None,
         timeout: int = 75,
         verify_ssl: bool = True,
+        allowed_folders: str = '',
     ) -> None:
         self.url = url
+        self._allowed_folders = tuple(p for p in (x.strip().strip('/') for x in allowed_folders.split(',')) if p)
         self.timeout = timeout
 
         self._crumb_header = None
@@ -75,6 +83,7 @@ class Jenkins:
         headers: dict = None,
         crumb: bool = True,
         params: dict = None,
+        stream: bool = False,
     ) -> Response:
         """Send an HTTP request to a Jenkins REST endpoint.
 
@@ -85,6 +94,7 @@ class Jenkins:
             headers: Optional headers to include in the request.
             crumb: Whether to include a CSRF crumb header.
             params: Optional query parameters to include in the request.
+            stream: Whether to defer downloading the response body.
 
         Returns:
             Response: The HTTP response object.
@@ -99,6 +109,7 @@ class Jenkins:
 
         url = self.endpoint_url(endpoint)
         logger.debug(f'Sending [{method}] request to {url}')
+        stream_kwargs = {'stream': True} if stream else {}
 
         response = self._session.request(
             method=method,
@@ -107,6 +118,7 @@ class Jenkins:
             params=params,
             data=data,
             timeout=self.timeout,
+            **stream_kwargs,
         )
 
         # When a Jenkins HTTP session expires the cached CSRF crumb becomes
@@ -124,6 +136,7 @@ class Jenkins:
                 params=params,
                 data=data,
                 timeout=self.timeout,
+                **stream_kwargs,
             )
 
         response.raise_for_status()
@@ -150,6 +163,25 @@ class Jenkins:
 
         return self._crumb_header
 
+    # Characters that could change where a request lands: query/fragment starters, percent-escapes,
+    # backslashes and control characters.
+    _UNSAFE_SEGMENT = re.compile(r'[?#%\\\x00-\x1f\x7f]')
+
+    def _safe_segments(self, value: str, *, what: str) -> list[str]:
+        """Split a slash-separated name and refuse empty, dot and unsafe segments."""
+        segments = value.split('/')
+        for part in segments:
+            if part.strip() in ('', '.', '..') or self._UNSAFE_SEGMENT.search(part):
+                msg = f'Invalid {what}: {value!r}'
+                raise ValueError(msg)
+        return segments
+
+    def _is_allowed(self, fullname: str) -> bool:
+        """True when no allowlist is set, or fullname is an allowed folder/job or inside one."""
+        if not self._allowed_folders:
+            return True
+        return any(fullname == p or fullname.startswith(p + '/') for p in self._allowed_folders)
+
     # A matrix configuration segment is a comma-separated list of axis=value pairs, e.g. "jdk=17,label=linux"
     _MATRIX_CONFIGURATION = re.compile(r'^[^=,]+=[^,]*(,[^=,]+=[^,]*)*$')
 
@@ -167,12 +199,18 @@ class Jenkins:
         Returns:
             The job URL path (e.g., "job/folder1/job/folder2/job/name").
         """
+        fullname = fullname.strip('/')
+        names = self._safe_segments(fullname, what='job fullname')
+        if not self._is_allowed(fullname):
+            msg = f'{fullname!r} is outside the allowed folders ({", ".join(self._allowed_folders)})'
+            raise PermissionError(msg)
+
         segments = []
-        for index, part in enumerate(fullname.split('/')):
+        for index, part in enumerate(names):
             if index > 0 and self._MATRIX_CONFIGURATION.match(part):
-                segments.append(part)
+                segments.append(quote(part, safe='=,:@+'))
             else:
-                segments.append(f'job/{part}')
+                segments.append(f'job/{quote(part, safe="=,:@+")}')
         return '/'.join(segments)
 
     def _build_view_path(self, view_path: str) -> str:
@@ -238,14 +276,6 @@ class Jenkins:
         response = self.request('GET', rest_endpoint.QUEUE_ITEM(id=id, depth=depth))
         return QueueItem.model_validate(response.json())
 
-    def cancel_queue_item(self, *, id: int) -> None:
-        """Cancel a queue item by its ID.
-
-        Args:
-            id: The ID of the queue item to cancel.
-        """
-        self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
-
     def get_node(self, *, name: str, depth: int = 0) -> Node:
         """Get a specific node by name.
 
@@ -257,7 +287,11 @@ class Jenkins:
             The Node object.
         """
         name = '(master)' if name in ('master', 'Built-In Node') else name
-        response = self.request('GET', rest_endpoint.NODE(name=name, depth=depth))
+        self._safe_segments(name, what='node name')
+        if '/' in name:
+            msg = f'Invalid node name: {name!r}'
+            raise ValueError(msg)
+        response = self.request('GET', rest_endpoint.NODE(name=quote(name, safe='()'), depth=depth))
         return Node.model_validate(response.json())
 
     def get_nodes(self, *, depth: int = 0) -> list[Node]:
@@ -271,32 +305,6 @@ class Jenkins:
         """
         response = self.request('GET', rest_endpoint.NODES(depth=depth))
         return [Node.model_validate(node) for node in response.json()['computer']]
-
-    def get_node_config(self, *, name: str) -> str:
-        """Get the configuration for a node.
-
-        Args:
-            name: The name of the node.
-
-        Returns:
-            The node configuration as an XML string.
-        """
-        response = self.request('GET', rest_endpoint.NODE_CONFIG(name=name))
-        return response.text
-
-    def set_node_config(self, *, name: str, config_xml: str) -> None:
-        """Set the configuration for a node.
-
-        Args:
-            name: The name of the node.
-            config_xml: The node configuration as an XML string.
-        """
-        self.request(
-            'POST',
-            rest_endpoint.NODE_CONFIG(name=name),
-            headers=self.DEFAULT_HEADERS,
-            data=config_xml,
-        )
 
     def get_build(self, *, fullname: str, number: int, depth: int = 0) -> Build:
         """Get build by fullname and number.
@@ -338,7 +346,11 @@ class Jenkins:
             The console output as a string.
         """
         job_path = self._job_path(fullname)
+        if pattern is not None and len(pattern) > self.MAX_PATTERN_LENGTH:
+            msg = f'pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
+            raise ValueError(msg)
         compiled = re.compile(pattern) if pattern else None
+        effective_limit = min(limit, self.MAX_CONSOLE_LINES) if limit else self.MAX_CONSOLE_LINES
 
         response = self._session.get(
             self.endpoint_url(rest_endpoint.BUILD_CONSOLE_OUTPUT(job_path=job_path, number=number)),
@@ -349,29 +361,30 @@ class Jenkins:
 
         matched: list[str] = []
         skipped = 0
+        scanned = 0
+        truncated = False
 
         for raw_line in response.iter_lines(decode_unicode=True):
+            scanned += 1
+            if scanned > self.MAX_CONSOLE_SCAN_LINES:
+                truncated = True
+                break
+            raw_line = raw_line[: self.MAX_CONSOLE_LINE_CHARS]
             if compiled is not None and not compiled.search(raw_line):
                 continue
             if skipped < offset:
                 skipped += 1
                 continue
             matched.append(raw_line)
-            if limit is not None and len(matched) >= limit:
+            if len(matched) >= effective_limit:
+                truncated = limit is None or limit > self.MAX_CONSOLE_LINES
                 break
 
         response.close()
+        if truncated:
+            hint = 'pass pattern, offset and limit to read more'
+            matched.append(f'[output truncated at {effective_limit} lines: {hint}]')
         return '\n'.join(matched)
-
-    def stop_build(self, *, fullname: str, number: int) -> None:
-        """Stop a running Jenkins build.
-
-        Args:
-            fullname: The fullname of the job.
-            number: The build number.
-        """
-        job_path = self._job_path(fullname)
-        self.request('POST', rest_endpoint.BUILD_STOP(job_path=job_path, number=number))
 
     def get_build_pending_inputs(self, *, fullname: str, number: int) -> list[PendingInput]:
         """Get the pending input steps of a specific build.
@@ -409,44 +422,6 @@ class Jenkins:
             raise
 
         return [PendingInput.model_validate(pending_input) for pending_input in response.json()]
-
-    def submit_build_input(
-        self,
-        *,
-        fullname: str,
-        number: int,
-        input_id: str,
-        action: Literal['proceed', 'proceedEmpty', 'abort'] = 'proceed',
-        parameters: dict | None = None,
-    ) -> None:
-        """Settle a pending input step of a specific build.
-
-        Args:
-            fullname: The fullname of the job.
-            number: The build number.
-            input_id: The id of the pending input step.
-            action: 'proceed' submits parameters, 'proceedEmpty' proceeds without any, 'abort' aborts the build.
-            parameters: A mapping of parameter name to value, only used when action is 'proceed'.
-        """
-        job_path = self._job_path(fullname)
-
-        # Stapler reads the submitted form from the `json` field, so it must be present even when the
-        # input step declares no parameters. `proceedEmpty` and `abort` take no body at all.
-        data = None
-        if action == 'proceed':
-            values = [{'name': key, 'value': value} for key, value in (parameters or {}).items()]
-            data = {'json': json.dumps({'parameter': values})}
-
-        self.request(
-            'POST',
-            rest_endpoint.BUILD_INPUT(
-                job_path=job_path,
-                number=number,
-                input_id=quote(input_id, safe=''),
-                action=action,
-            ),
-            data=data,
-        )
 
     def get_build_replay(self, *, fullname: str, number: int) -> BuildReplay:
         """Get the build replay of a specific build.
@@ -608,9 +583,30 @@ class Jenkins:
         job_path = self._job_path(fullname)
         response = self.request(
             'GET',
-            rest_endpoint.BUILD_ARTIFACT(job_path=job_path, number=number, relative_path=relative_path),
+            rest_endpoint.BUILD_ARTIFACT(
+                job_path=job_path, number=number, relative_path=self._artifact_path(relative_path)
+            ),
+            stream=True,
         )
-        return response.content
+        try:
+            declared = int(response.headers.get('Content-Length', 0))
+            if declared > self.MAX_ARTIFACT_BYTES:
+                msg = f'Artifact is {declared} bytes, over the {self.MAX_ARTIFACT_BYTES} byte limit'
+                raise ValueError(msg)
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                content.extend(chunk)
+                if len(content) > self.MAX_ARTIFACT_BYTES:
+                    msg = f'Artifact is over the {self.MAX_ARTIFACT_BYTES} byte limit'
+                    raise ValueError(msg)
+        finally:
+            response.close()
+        return bytes(content)
+
+    def _artifact_path(self, relative_path: str) -> str:
+        """Quote each segment of an artifact's relative path and refuse traversal or unsafe characters."""
+        segments = self._safe_segments(relative_path.strip('/'), what='artifact path')
+        return '/'.join(quote(part, safe='') for part in segments)
 
     def get_build_artifact_url(self, *, fullname: str, number: int, relative_path: str) -> str:
         """Get the direct URL of a specific artifact from a build.
@@ -625,7 +621,9 @@ class Jenkins:
         """
         job_path = self._job_path(fullname)
         return self.endpoint_url(
-            rest_endpoint.BUILD_ARTIFACT(job_path=job_path, number=number, relative_path=relative_path),
+            rest_endpoint.BUILD_ARTIFACT(
+                job_path=job_path, number=number, relative_path=self._artifact_path(relative_path)
+            ),
         )
 
     def get_running_builds(self) -> list[Build]:
@@ -677,7 +675,29 @@ class Jenkins:
                 if isinstance(children, list) and (folder_depth is None or level < folder_depth):
                     item_stack.append((level + 1, job_path, children))
 
+        if self._allowed_folders:
+            items = [i for i in items if i.fullname and self._is_listed(i.fullname)]
+
         return items
+
+    def _is_listed(self, fullname: str) -> bool:
+        """Allowed items, plus the parent folders leading to them so the tree stays navigable."""
+        return self._is_allowed(fullname) or any(p.startswith(fullname + '/') for p in self._allowed_folders)
+
+    def get_builds(self, *, fullname: str, limit: int = 20) -> list[dict]:
+        """List the most recent builds of a job, newest first.
+
+        Args:
+            fullname: The full name of the job.
+            limit: How many builds to return (1-100).
+
+        Returns:
+            A list of dicts with number, url, result, building, timestamp and duration.
+        """
+        job_path = self._job_path(fullname)
+        limit = max(1, min(limit, 100))
+        response = self.request('GET', rest_endpoint.ITEM_BUILDS(job_path=job_path, limit=limit))
+        return response.json().get('builds') or []
 
     def get_item(self, *, fullname: str, depth: int = 0) -> ItemType:
         """Get item by its fullname.
@@ -729,21 +749,6 @@ class Jenkins:
         response = self.request('GET', rest_endpoint.ITEM_CONFIG(job_path=job_path))
         return response.text
 
-    def set_item_config(self, *, fullname: str, config_xml: str) -> None:
-        """Set item configuration by its fullname.
-
-        Args:
-            fullname: The full name of the item (e.g., "folder1/folder2/item").
-            config_xml: The item configuration as an XML string.
-        """
-        job_path = self._job_path(fullname)
-        self.request(
-            'POST',
-            rest_endpoint.ITEM_CONFIG(job_path=job_path),
-            headers=self.DEFAULT_HEADERS,
-            data=config_xml,
-        )
-
     def query_items(
         self,
         *,
@@ -786,35 +791,6 @@ class Jenkins:
             result.append(item)
 
         return result
-
-    def build_item(
-        self,
-        *,
-        fullname: str,
-        build_type: Literal['build', 'buildWithParameters'],
-        data: dict | None = None,
-    ) -> int:
-        """Trigger a build for a specific item.
-
-        Warnings:
-            If your job is configured with parameters, you must use 'buildWithParameters' as build_type.
-
-        Args:
-            fullname: The fullname of the job.
-            build_type: The type of build to trigger.
-            data: The parameters to trigger the build with. Required if build_type is 'buildWithParameters'.
-
-        Return:
-            The queue item number of the job.
-        """
-        job_path = self._job_path(fullname)
-        response = self.request(
-            'POST',
-            rest_endpoint.ITEM_BUILD(job_path=job_path, build_type=build_type),
-            data=data,
-        )
-
-        return int(response.headers.get('Location', None).strip('/').split('/')[-1])
 
     def get_plugins(self, *, depth: int = 0) -> list[dict]:
         """Get a list of all installed plugins.
@@ -1083,20 +1059,3 @@ class Jenkins:
         traverse(short_name)
 
         return {'nodes': nodes, 'edges': edges}
-
-    def run_script(self, script: str) -> str:  # noqa: N802
-        """Execute a Groovy script on Jenkins.
-
-        Args:
-            script: The Groovy script code to execute.
-
-        Returns:
-            The result of the script execution.
-        """
-        response = self.request('POST', rest_endpoint.SCRIPT_TEXT, data={'script': script.encode('utf-8')})
-
-        result = response.text
-        result_prefix = 'Result: '
-        if result.startswith(result_prefix):
-            return result[len(result_prefix) :].rstrip('\n')
-        return result

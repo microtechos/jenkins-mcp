@@ -60,15 +60,6 @@ async def test_get_item_config(mock_jenkins, mocker):
 
 
 @pytest.mark.asyncio
-async def test_set_item_config(mock_jenkins, mocker):
-    mock_jenkins.set_item_config.return_value = None
-
-    await item.set_item_config(mocker.Mock(), fullname='job1', config_xml='<xml>config</xml>')
-
-    mock_jenkins.set_item_config.assert_called_once_with(fullname='job1', config_xml='<xml>config</xml>')
-
-
-@pytest.mark.asyncio
 async def test_query_items(mock_jenkins, mocker):
     mock_jenkins.query_items.return_value = [
         Job(fullname='job1', color='blue', name='job1', url='1', class_='Job'),
@@ -106,22 +97,6 @@ async def test_query_items_accepts_explicit_null(mock_jenkins):
         fullname_pattern=None,
         color_pattern=None,
         folder_depth=None,
-    )
-
-
-@pytest.mark.asyncio
-async def test_build_item(mock_jenkins, mocker):
-    mock_jenkins.build_item.return_value = None
-
-    await item.build_item(
-        mocker.Mock(),
-        fullname='job1',
-        data={'param1': 'value1'},
-        build_type='buildWithParameters',
-    )
-
-    mock_jenkins.build_item.assert_called_once_with(
-        fullname='job1', data={'param1': 'value1'}, build_type='buildWithParameters'
     )
 
 

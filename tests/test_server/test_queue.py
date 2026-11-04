@@ -44,8 +44,3 @@ async def test_get_queue_item(mock_jenkins, mocker):
         'task': {'fullDisplayName': '1', 'name': '1', 'url': '1'},
     }
 
-
-@pytest.mark.asyncio
-async def test_cancel_queue_item(mock_jenkins, mocker):
-    await queue.cancel_queue_item(mocker.Mock(), id=1)
-    mock_jenkins.cancel_queue_item.assert_called_once_with(id=1)
