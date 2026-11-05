@@ -22,6 +22,10 @@ ITEMS = RestEndpoint('{folder}/api/json?tree={query}')
 ITEM_CONFIG = RestEndpoint('{job_path}/config.xml')
 ITEM_BUILD_INFO = RestEndpoint('{job_path}/api/json?tree=buildable,property[parameterDefinitions[name]]')
 ITEM_TRIGGER = RestEndpoint('{job_path}/{action}')
+QUEUE_ITEM_INFO = RestEndpoint('queue/item/{id}/api/json?tree=id,cancelled,task[name,url]')
+QUEUE_CANCEL_ITEM = RestEndpoint('queue/cancelItem?id={id}')
+BUILD_STATE = RestEndpoint('{job_path}/{number}/api/json?tree=number,building,result')
+BUILD_STOP = RestEndpoint('{job_path}/{number}/stop')
 ITEM_BUILDS = RestEndpoint(
     '{job_path}/api/json?tree=builds[number,url,result,building,timestamp,duration]{{0,{limit}}}'
 )

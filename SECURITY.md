@@ -14,7 +14,7 @@ reproduce it and the impact. Expect an acknowledgement within a few working days
 
 ## Design rules that must not regress
 
-- The only tool that sends a non-GET request is `trigger_build`: it is not registered unless the server is started with `--allow-trigger`, it can start only the exact jobs in `--trigger-jobs`, and it does nothing without `confirm=true`. No tool runs scripts.
+- The only tools that send a non-GET request are `trigger_build`, `stop_build` and `cancel_queue_item`: they are not registered unless the server is started with `--allow-trigger`, they act only on the exact jobs in `--trigger-jobs` (a queue item is read first and refused unless its job is listed), and they do nothing without `confirm=true`. No tool runs scripts.
 - Only stdio is supported; no network listener.
 - The Jenkins URL and credentials come only from the server's own configuration.
 - Job names, node names and artifact paths are validated and URL-quoted before use.

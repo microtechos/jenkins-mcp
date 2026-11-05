@@ -1,7 +1,7 @@
 import re
 from functools import reduce
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -688,6 +688,21 @@ class Jenkins:
         """Allowed items, plus the parent folders leading to them so the tree stays navigable."""
         return self._is_allowed(fullname) or any(p.startswith(fullname + '/') for p in self._allowed_folders)
 
+    def _require_trigger_enabled(self) -> None:
+        """Gate for every write: the opt-in switch."""
+        if not self._allow_trigger:
+            msg = 'Starting and stopping builds is disabled: start with --allow-trigger (JENKINS_ALLOW_TRIGGER=true)'
+            raise PermissionError(msg)
+
+    def _require_release_job(self, fullname: str) -> str:
+        """The opt-in switch, then the exact job allowlist. Returns the normalised name."""
+        self._require_trigger_enabled()
+        fullname = fullname.strip().strip('/')
+        if fullname not in self._trigger_jobs:
+            msg = f'{fullname!r} is not in the trigger allowlist ({len(self._trigger_jobs)} job(s) allowed)'
+            raise PermissionError(msg)
+        return fullname
+
     def trigger_build(self, *, fullname: str, confirm: bool = False) -> dict:
         """Start a build of one allowlisted job. The only write this server can make.
 
@@ -702,13 +717,7 @@ class Jenkins:
             A dict with job, action, parameterised, dryRun and, after a real start, queueItem and queueUrl.
             A parameterised job is started with its default parameter values.
         """
-        fullname = fullname.strip().strip('/')
-        if not self._allow_trigger:
-            msg = 'Starting builds is disabled: start the server with --allow-trigger (JENKINS_ALLOW_TRIGGER=true)'
-            raise PermissionError(msg)
-        if fullname not in self._trigger_jobs:
-            msg = f'{fullname!r} is not in the trigger allowlist ({len(self._trigger_jobs)} job(s) allowed)'
-            raise PermissionError(msg)
+        fullname = self._require_release_job(fullname)
 
         job_path = self._job_path(fullname)
         info = self.request('GET', rest_endpoint.ITEM_BUILD_INFO(job_path=job_path)).json()
@@ -727,6 +736,80 @@ class Jenkins:
         match = re.search(r'/queue/item/(\d+)/?$', location)
         result['queueItem'] = int(match.group(1)) if match else None
         result['queueUrl'] = location or None
+        return result
+
+    def stop_build(self, *, fullname: str, number: int, confirm: bool = False) -> dict:
+        """Stop one running build of an allowlisted job. Same switch, allowlist and dry run as trigger_build.
+
+        Args:
+            fullname: The full name of the job (must be in the trigger allowlist).
+            number: The build number; it must be running.
+            confirm: False (default) = dry run; True = stop the build.
+
+        Returns:
+            A dict with job, number, action, building and dryRun.
+        """
+        fullname = self._require_release_job(fullname)
+        job_path = self._job_path(fullname)
+        number = int(number)
+        if number < 1:
+            msg = f'Invalid build number: {number}'
+            raise ValueError(msg)
+
+        state = self.request('GET', rest_endpoint.BUILD_STATE(job_path=job_path, number=number)).json()
+        if not state.get('building'):
+            msg = f'{fullname} #{number} is not running (result: {state.get("result")})'
+            raise ValueError(msg)
+
+        result = {'job': fullname, 'number': number, 'action': 'stop', 'building': True, 'dryRun': not confirm}
+        if confirm:
+            self.request('POST', rest_endpoint.BUILD_STOP(job_path=job_path, number=number))
+        return result
+
+    def _queue_item_job(self, task_url: str) -> str | None:
+        """The job full name behind a queue item's task url, or None when it is not a job on this Jenkins."""
+        prefix = self.url.rstrip('/') + '/'
+        if not task_url.startswith(prefix):
+            return None
+        parts = [p for p in task_url[len(prefix):].split('/') if p]
+        if not parts or len(parts) % 2 or any(parts[i] != 'job' for i in range(0, len(parts), 2)):
+            return None
+        return '/'.join(unquote(parts[i]) for i in range(1, len(parts), 2))
+
+    def cancel_queue_item(self, *, id: int, confirm: bool = False) -> dict:  # noqa: A002
+        """Cancel one queued build, only when its job is on the trigger allowlist.
+
+        A queue id does not name the job, so the item is read first and its job is checked against the list.
+
+        Args:
+            id: The queue item id (as returned by trigger_build).
+            confirm: False (default) = dry run; True = cancel the item.
+
+        Returns:
+            A dict with queueItem, job, action and dryRun.
+        """
+        self._require_trigger_enabled()
+        id = int(id)  # noqa: A001
+        if id < 1:
+            msg = f'Invalid queue item id: {id}'
+            raise ValueError(msg)
+
+        try:
+            item = self.request('GET', rest_endpoint.QUEUE_ITEM_INFO(id=id)).json()
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                msg = f'Queue item {id} not found (it already started, or was cancelled)'
+                raise ValueError(msg) from e
+            raise
+
+        job = self._queue_item_job((item.get('task') or {}).get('url') or '')
+        if job is None or job not in self._trigger_jobs:
+            msg = f'Queue item {id} belongs to {job or "an unknown task"}, which is not in the trigger allowlist'
+            raise PermissionError(msg)
+
+        result = {'queueItem': id, 'job': job, 'action': 'cancel', 'dryRun': not confirm}
+        if confirm:
+            self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
         return result
 
     def get_builds(self, *, fullname: str, limit: int = 20) -> list[dict]:
