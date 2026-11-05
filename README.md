@@ -2,7 +2,7 @@
 
 Microtech fork of [lanbaoshen/mcp-jenkins](https://github.com/lanbaoshen/mcp-jenkins) (MIT), a Model
 Context Protocol server that lets an AI assistant read a Jenkins instance. Upstream version `3.6.0`
-(commit `1d8587e`) is the baseline; this fork is **read-only by construction**.
+(commit `1d8587e`) is the baseline; this fork is **read-only by default** and has exactly one opt-in write tool, an allowlisted `trigger_build`.
 
 It is the transport behind the `microtech-jenkins` plugin in the `microtech-hub` marketplace. End users
 do not run it by hand: the plugin's `.mcp.json` starts it and supplies the credentials.
@@ -12,6 +12,7 @@ do not run it by hand: the plugin's `.mcp.json` starts it and supplies the crede
 | Area | Upstream | This fork | Why |
 | --- | --- | --- |---|
 | Write tools (`build_item`, `stop_build`, `cancel_queue_item`, `submit_input`, `set_item_config`, `set_node_config`) | Present, hidden by `--read-only` | Deleted | A flag can be forgotten or regress; deleted code can not run |
+| Starting a build | `build_item`: any job, any parameters | `trigger_build`: off by default; with `--allow-trigger` only the exact jobs in `--trigger-jobs`; dry run unless `confirm=true`; parameterised jobs use their defaults | Release automation can start the release jobs and nothing else |
 | `run_groovy_script` | Present | Deleted | It is code execution on the Jenkins controller |
 | `get_node_config` | Present | Deleted | Node configs carry agent connection details and are not needed |
 | Transports | stdio, SSE, streamable-http (binds `0.0.0.0`, no auth) | stdio only | Nothing is ever exposed on a network port |
@@ -40,6 +41,8 @@ uvx --from git+https://github.com/microtechos/jenkins-mcp@<tag-or-sha> mcp-jenki
 | `--jenkins-password` | `JENKINS_PASSWORD` | API token (preferred) or password |
 | `--jenkins-timeout` | `JENKINS_TIMEOUT` | Seconds per request, default 5 |
 | `--jenkins-verify-ssl/--no-jenkins-verify-ssl` | `JENKINS_VERIFY_SSL` | TLS verification, default on |
+| `--allow-trigger` | `JENKINS_ALLOW_TRIGGER` | Register `trigger_build` (default off) |
+| `--trigger-jobs` | `JENKINS_TRIGGER_JOBS` | Comma-separated exact job full names `trigger_build` may start. Empty = none |
 | `--allowed-folders` | `JENKINS_ALLOWED_FOLDERS` | Comma-separated folder/job full names that may be read, e.g. `Branch-Retail,Branch-Salon`. Empty = no restriction |
 | `--env-file` | | Load the settings above from a file (never auto-discovered) |
 
@@ -49,7 +52,7 @@ instance-level metadata and are not filtered: for a hard boundary also give the 
 permissions it needs (Overall/Read, Job/Read on the folders, Job/ExtendedRead only if `get_item_config`
 is wanted).
 
-## Tools (29, all read-only)
+## Tools (29 read-only, plus `trigger_build` when enabled)
 
 | Group | Tools |
 | --- | --- |
@@ -58,6 +61,7 @@ is wanted).
 | Artifacts | `get_all_build_artifacts`, `get_build_artifact`, `get_build_artifact_url` |
 | Views / queue / nodes | `get_all_views`, `get_view`, `get_all_queue_items`, `get_queue_item`, `get_all_nodes`, `get_node` |
 | Plugins | `get_all_plugins`, `get_plugin`, `get_plugins_with_problems`, `get_plugins_with_updates`, `get_plugins_with_backup`, `get_plugin_dependency_graph` |
+| Trigger (opt-in) | `trigger_build(fullname, confirm=false)` |
 
 `get_all_items` and an unfiltered `query_items` return very large results on a big instance: prefer
 `query_items` with `fullname_pattern` and `folder_depth`.
@@ -70,8 +74,8 @@ uv run pytest
 uv run --with ruff ruff check src tests
 ```
 
-Keep the fork read-only: a new tool must be a read tool, and nothing that sends a non-GET request to
-Jenkins is added without a separate, explicit decision. Upstream changes are taken by diff or
+Keep the fork read-only apart from `trigger_build`: a new tool must be a read tool, and nothing else that
+sends a non-GET request to Jenkins is added without a separate, explicit decision. Upstream changes are taken by diff or
 cherry-pick (the history is not shared). Release by tagging; the plugin pins a full commit SHA.
 
 ## License

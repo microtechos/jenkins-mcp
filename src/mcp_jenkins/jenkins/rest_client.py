@@ -50,9 +50,13 @@ class Jenkins:
         timeout: int = 75,
         verify_ssl: bool = True,
         allowed_folders: str = '',
+        allow_trigger: bool = False,
+        trigger_jobs: str = '',
     ) -> None:
         self.url = url
         self._allowed_folders = tuple(p for p in (x.strip().strip('/') for x in allowed_folders.split(',')) if p)
+        self._allow_trigger = allow_trigger
+        self._trigger_jobs = frozenset(p for p in (x.strip().strip('/') for x in trigger_jobs.split(',')) if p)
         self.timeout = timeout
 
         self._crumb_header = None
@@ -683,6 +687,47 @@ class Jenkins:
     def _is_listed(self, fullname: str) -> bool:
         """Allowed items, plus the parent folders leading to them so the tree stays navigable."""
         return self._is_allowed(fullname) or any(p.startswith(fullname + '/') for p in self._allowed_folders)
+
+    def trigger_build(self, *, fullname: str, confirm: bool = False) -> dict:
+        """Start a build of one allowlisted job. The only write this server can make.
+
+        Disabled unless the server was started with allow_trigger, and limited to the exact job full names in
+        trigger_jobs. Without confirm nothing is sent: the result only says what would be started.
+
+        Args:
+            fullname: The full name of the job (must be in the trigger allowlist).
+            confirm: False (default) = dry run; True = really start the build.
+
+        Returns:
+            A dict with job, action, parameterised, dryRun and, after a real start, queueItem and queueUrl.
+            A parameterised job is started with its default parameter values.
+        """
+        fullname = fullname.strip().strip('/')
+        if not self._allow_trigger:
+            msg = 'Starting builds is disabled: start the server with --allow-trigger (JENKINS_ALLOW_TRIGGER=true)'
+            raise PermissionError(msg)
+        if fullname not in self._trigger_jobs:
+            msg = f'{fullname!r} is not in the trigger allowlist ({len(self._trigger_jobs)} job(s) allowed)'
+            raise PermissionError(msg)
+
+        job_path = self._job_path(fullname)
+        info = self.request('GET', rest_endpoint.ITEM_BUILD_INFO(job_path=job_path)).json()
+        if not info.get('buildable'):
+            msg = f'{fullname!r} is not a buildable job (disabled, or a folder)'
+            raise ValueError(msg)
+
+        parameterised = any(p.get('parameterDefinitions') for p in info.get('property') or [])
+        action = 'buildWithParameters' if parameterised else 'build'
+        result = {'job': fullname, 'action': action, 'parameterised': parameterised, 'dryRun': not confirm}
+        if not confirm:
+            return result
+
+        response = self.request('POST', rest_endpoint.ITEM_TRIGGER(job_path=job_path, action=action))
+        location = response.headers.get('Location') or ''
+        match = re.search(r'/queue/item/(\d+)/?$', location)
+        result['queueItem'] = int(match.group(1)) if match else None
+        result['queueUrl'] = location or None
+        return result
 
     def get_builds(self, *, fullname: str, limit: int = 20) -> list[dict]:
         """List the most recent builds of a job, newest first.

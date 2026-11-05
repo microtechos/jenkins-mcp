@@ -17,6 +17,8 @@ class LifespanContext(BaseModel):
     jenkins_timeout: int = 5
     jenkins_verify_ssl: bool = True
     jenkins_allowed_folders: str = ''
+    jenkins_allow_trigger: bool = False
+    jenkins_trigger_jobs: str = ''
 
     jenkins_session_singleton: bool = True
 
@@ -31,6 +33,8 @@ async def lifespan(app: FastMCP[LifespanContext]) -> AsyncIterator['LifespanCont
     jenkins_verify_ssl = os.getenv('jenkins_verify_ssl', 'true').lower() == 'true'
     jenkins_session_singleton = os.getenv('jenkins_session_singleton', 'true').lower() == 'true'
     jenkins_allowed_folders = os.getenv('jenkins_allowed_folders', '')
+    jenkins_allow_trigger = os.getenv('jenkins_allow_trigger', 'false').lower() == 'true'
+    jenkins_trigger_jobs = os.getenv('jenkins_trigger_jobs', '')
 
     yield LifespanContext(
         jenkins_url=jenkins_url,
@@ -39,6 +43,8 @@ async def lifespan(app: FastMCP[LifespanContext]) -> AsyncIterator['LifespanCont
         jenkins_timeout=jenkins_timeout,
         jenkins_verify_ssl=jenkins_verify_ssl,
         jenkins_allowed_folders=jenkins_allowed_folders,
+        jenkins_allow_trigger=jenkins_allow_trigger,
+        jenkins_trigger_jobs=jenkins_trigger_jobs,
         jenkins_session_singleton=jenkins_session_singleton,
     )
 
@@ -75,6 +81,8 @@ def jenkins(ctx: Context) -> Jenkins:
         timeout=lifespan_context.jenkins_timeout,
         verify_ssl=lifespan_context.jenkins_verify_ssl,
         allowed_folders=lifespan_context.jenkins_allowed_folders,
+        allow_trigger=lifespan_context.jenkins_allow_trigger,
+        trigger_jobs=lifespan_context.jenkins_trigger_jobs,
     )
 
     return ctx.session.jenkins

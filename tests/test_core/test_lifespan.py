@@ -29,6 +29,8 @@ class TestLifespan:
                 'jenkins_verify_ssl': 'true',
                 'jenkins_session_singleton': 'true',
                 'jenkins_allowed_folders': 'Branch-Retail',
+                'jenkins_allow_trigger': 'true',
+                'jenkins_trigger_jobs': 'F/a,F/b',
             }
             return env.get(key, default)
 
@@ -41,6 +43,8 @@ class TestLifespan:
             assert context.jenkins_verify_ssl is True
             assert context.jenkins_session_singleton is True
             assert context.jenkins_allowed_folders == 'Branch-Retail'
+            assert context.jenkins_allow_trigger is True
+            assert context.jenkins_trigger_jobs == 'F/a,F/b'
 
 
 class TestJenkins:
@@ -58,6 +62,8 @@ class TestJenkins:
                 'jenkins_timeout': 5,
                 'jenkins_verify_ssl': True,
                 'jenkins_allowed_folders': '',
+                'jenkins_allow_trigger': False,
+                'jenkins_trigger_jobs': '',
                 'jenkins_session_singleton': True,
             }
             values.update(overrides)
@@ -69,7 +75,12 @@ class TestJenkins:
         return make
 
     def test_builds_client_from_server_configuration(self, mock_jenkins, make_ctx):
-        ctx = make_ctx(jenkins_allowed_folders='Branch-Retail', jenkins_verify_ssl=False)
+        ctx = make_ctx(
+            jenkins_allowed_folders='Branch-Retail',
+            jenkins_verify_ssl=False,
+            jenkins_allow_trigger=True,
+            jenkins_trigger_jobs='F/job',
+        )
 
         result = jenkins(ctx)
 
@@ -80,6 +91,8 @@ class TestJenkins:
             timeout=5,
             verify_ssl=False,
             allowed_folders='Branch-Retail',
+            allow_trigger=True,
+            trigger_jobs='F/job',
         )
         assert result is ctx.session.jenkins
 

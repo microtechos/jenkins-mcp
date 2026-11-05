@@ -20,6 +20,8 @@ ITEM = RestEndpoint('{job_path}/api/json?depth={depth}')
 ITEM_LAST_BUILD_NUMBER = RestEndpoint('{job_path}/api/json?tree=lastBuild[number],buildable')
 ITEMS = RestEndpoint('{folder}/api/json?tree={query}')
 ITEM_CONFIG = RestEndpoint('{job_path}/config.xml')
+ITEM_BUILD_INFO = RestEndpoint('{job_path}/api/json?tree=buildable,property[parameterDefinitions[name]]')
+ITEM_TRIGGER = RestEndpoint('{job_path}/{action}')
 ITEM_BUILDS = RestEndpoint(
     '{job_path}/api/json?tree=builds[number,url,result,building,timestamp,duration]{{0,{limit}}}'
 )

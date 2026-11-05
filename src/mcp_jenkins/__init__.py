@@ -47,6 +47,18 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
     'Empty means no restriction. Job reads outside the list are refused and listings are filtered.',
 )
 @click.option(
+    '--allow-trigger/--no-allow-trigger',
+    default=False,
+    envvar='JENKINS_ALLOW_TRIGGER',
+    help='Register the trigger_build tool, the only tool that writes. Off by default.',
+)
+@click.option(
+    '--trigger-jobs',
+    default='',
+    envvar='JENKINS_TRIGGER_JOBS',
+    help='Comma-separated exact job full names trigger_build may start. Empty = none can be started.',
+)
+@click.option(
     '--read-only',
     default=True,
     is_flag=True,
@@ -78,6 +90,8 @@ def main(
     jenkins_timeout: int,
     jenkins_verify_ssl: bool,  # noqa: FBT001
     allowed_folders: str,
+    allow_trigger: bool,  # noqa: FBT001
+    trigger_jobs: str,
     read_only: bool,  # noqa: ARG001, FBT001
     tool_regex: str,
     jenkins_session_singleton: bool,  # noqa: FBT001
@@ -94,6 +108,8 @@ def main(
     os.environ['jenkins_verify_ssl'] = str(jenkins_verify_ssl).lower()
     os.environ['jenkins_session_singleton'] = str(jenkins_session_singleton).lower()
     os.environ['jenkins_allowed_folders'] = allowed_folders
+    os.environ['jenkins_allow_trigger'] = str(allow_trigger).lower()
+    os.environ['jenkins_trigger_jobs'] = trigger_jobs
 
     from mcp_jenkins.server import mcp
 
