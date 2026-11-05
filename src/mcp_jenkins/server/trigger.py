@@ -2,7 +2,7 @@ from fastmcp import Context
 
 from mcp_jenkins.core.lifespan import jenkins
 from mcp_jenkins.server import mcp
-from mcp_jenkins.server.approval import require_approval
+from mcp_jenkins.server.approval import require_approval, start_message
 
 
 @mcp.tool(tags=['trigger'])
@@ -12,7 +12,8 @@ async def trigger_build(ctx: Context, fullname: str, confirm: bool = False) -> d
     Only registered when the server was started with --allow-trigger, and only for the exact jobs in
     --trigger-jobs. A dry run is the default: call it first, show the result to the user (it lists the branch,
     default parameters and downstream jobs), and only call again with confirm=True when the user has said to
-    start that job. A confirmed start also asks the user for approval through the client. A parameterised job is
+    start that job. A confirmed start also asks the user for approval through the client, showing the branch,
+    parameters and downstream jobs, and is refused if the job changed after the dry run. A parameterised job is
     started with its default parameter values. Starting a job may deploy to production.
 
     Args:
@@ -20,16 +21,16 @@ async def trigger_build(ctx: Context, fullname: str, confirm: bool = False) -> d
         confirm: False (default) = dry run, nothing is started; True = start the build
 
     Returns:
-        job, action, parameterised, dryRun, branches, parameters, downstream and, after a real start,
-        queueItem and queueUrl
+        job, action, parameterised, dryRun, branches, parameters, downstream, contextDigest and, after a real
+        start, queueItem and queueUrl
     """
     client = jenkins(ctx)
     plan = client.trigger_build(fullname=fullname, confirm=False)
     if not confirm:
         return plan
 
-    await require_approval(ctx, f'Start a build of {plan["job"]}? It may deploy to production.')
-    return client.trigger_build(fullname=fullname, confirm=True)
+    await require_approval(ctx, start_message(plan))
+    return client.trigger_build(fullname=fullname, confirm=True, context_digest=plan.get('contextDigest'))
 
 
 @mcp.tool(tags=['trigger'])

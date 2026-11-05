@@ -37,6 +37,9 @@ NODE = RestEndpoint('computer/{name}/api/json?depth={depth}')
 NODES = RestEndpoint('computer/api/json?depth={depth}')
 
 VIEW = RestEndpoint('{view_path}/api/json?depth={depth}')
+VIEW_COMPACT = RestEndpoint(
+    '{view_path}/api/json?tree=name,url,description,jobs[_class,name,url,color],views[name,url]'
+)
 VIEWS = RestEndpoint('api/json?tree=views[name,url]')
 
 BUILD = RestEndpoint('{job_path}/{number}/api/json?depth={depth}')

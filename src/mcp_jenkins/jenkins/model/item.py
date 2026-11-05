@@ -1,6 +1,6 @@
 from typing import Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mcp_jenkins.jenkins.model.build import Build
 
@@ -37,6 +37,15 @@ class MultiBranchProject(_ItemBase):
 
 class UnknownItem(_ItemBase):
     model_config = ConfigDict(extra='allow')
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_sensitive_properties(cls, data: object) -> object:
+        """Unknown job types are returned with their extra fields, but never their properties or actions:
+        those carry job parameter defaults and the parameters of past builds."""
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if k not in ('property', 'actions')}
+        return data
 
 
 def serialize_item(item: dict) -> ItemType:

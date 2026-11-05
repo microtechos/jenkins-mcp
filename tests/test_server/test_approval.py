@@ -18,12 +18,18 @@ from mcp_jenkins.server import mcp
 mode = os.environ['TEST_MODE']  # accept | decline | unchecked | unsupported
 tool, args = os.environ['TEST_TOOL'], json.loads(os.environ['TEST_ARGS'])
 calls = []
+digests = []
 
 
 def make_fake(name):
     def fake(self, **kwargs):
         calls.append((name, kwargs.get('confirm')))
-        return {'job': 'A/b', 'number': 3, 'queueItem': 5, 'dryRun': not kwargs.get('confirm')}
+        digests.append(kwargs.get('context_digest'))
+        return {
+            'job': 'A/b', 'number': 3, 'queueItem': 5, 'dryRun': not kwargs.get('confirm'),
+            'branches': ['*/release/production'], 'parameters': [{'name': 'BRANCH', 'default': 'main'}],
+            'downstream': ['02-report'], 'contextDigest': 'digest-1',
+        }
 
     return fake
 
@@ -43,7 +49,7 @@ async def main():
     with mock.patch.object(Jenkins, tool, make_fake(tool)):
         async with Client(mcp, **kwargs) as client:
             result = await client.call_tool(tool, args, raise_on_error=False)
-    print(json.dumps({'calls': calls, 'error': bool(result.is_error)}))
+    print(json.dumps({'calls': calls, 'digests': digests, 'error': bool(result.is_error)}))
 
 
 asyncio.run(main())
@@ -60,7 +66,8 @@ ENV = {
 
 def run(mode, tool='trigger_build', args=None, **extra: str):
     arguments = args or {'fullname': 'A/b', 'confirm': True}
-    env = {**os.environ, **ENV, 'TEST_MODE': mode, 'TEST_TOOL': tool, 'TEST_ARGS': json.dumps(arguments), **extra}
+    ambient = {key: value for key, value in os.environ.items() if not key.lower().startswith('jenkins_')}
+    env = {**ambient, **ENV, 'TEST_MODE': mode, 'TEST_TOOL': tool, 'TEST_ARGS': json.dumps(arguments), **extra}
     command = [sys.executable, '-W', 'ignore', '-c', SCRIPT]
     out = subprocess.run(command, env=env, capture_output=True, text=True, check=False)  # noqa: S603
     assert out.returncode == 0, out.stderr[-800:]
@@ -118,3 +125,14 @@ def test_a_dry_run_never_asks():
     assert result['error'] is False
     assert not any(c[0] == 'asked' for c in result['calls'])
     assert starts(result) == []
+
+
+def test_the_prompt_shows_what_will_run_and_the_start_is_bound_to_the_dry_run():
+    result = run('accept')
+
+    message = next(c[1] for c in result['calls'] if c[0] == 'asked')
+    assert 'Branch: */release/production' in message
+    assert 'BRANCH=main' in message
+    assert 'Then starts: 02-report' in message
+    assert result['digests'] == [None, 'digest-1'], 'the confirmed call carries the dry run digest'
+

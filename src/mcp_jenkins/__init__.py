@@ -55,7 +55,7 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
     '--allow-trigger/--no-allow-trigger',
     default=False,
     envvar='JENKINS_ALLOW_TRIGGER',
-    help='Register the trigger_build tool, the only tool that writes. Off by default.',
+    help='Register trigger_build, stop_build and cancel_queue_item, the only tools that write. Off by default.',
 )
 @click.option(
     '--trigger-jobs',
@@ -73,9 +73,8 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
 @click.option(
     '--require-approval/--no-require-approval',
     default=True,
-    envvar='JENKINS_REQUIRE_APPROVAL',
     help='Ask the user (MCP elicitation) before any confirmed start, stop or cancel. Default on; if the client '
-    'cannot ask, the action is refused.',
+    'cannot ask, the action is refused. Command-line only: an environment variable can not switch it off.',
 )
 @click.option(
     '--audit-log',
@@ -95,7 +94,7 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
     default=True,
     is_flag=True,
     hidden=True,
-    help='Deprecated and ignored: this fork has no write tools, so it is always read-only.',
+    help='Deprecated and ignored: the write tools exist only with --allow-trigger.',
 )
 @click.option(
     '--tool-regex',

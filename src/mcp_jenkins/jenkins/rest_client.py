@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import xml.etree.ElementTree as ET
@@ -26,6 +27,7 @@ from mcp_jenkins.jenkins.model.item import (
 from mcp_jenkins.jenkins.model.node import Node
 from mcp_jenkins.jenkins.model.queue import Queue, QueueItem
 from mcp_jenkins.jenkins.redact import redact_text
+from mcp_jenkins.jenkins.safe_regex import compile_safe
 
 
 class PendingInputsUnavailableError(ValueError):
@@ -262,14 +264,39 @@ class Jenkins:
 
         Args:
             view_path: Slash-separated view path.
-            depth: The depth of the information to retrieve.
+            depth: Accepted for compatibility and ignored: views are always returned compact.
 
         Returns:
-            A dictionary with the view's name, jobs, and/or nested views.
+            A dictionary with the view's name, jobs (name, url, colour, kind), and/or nested views.
         """
         url_path = self._build_view_path(view_path)
-        response = self.request('GET', rest_endpoint.VIEW(view_path=url_path, depth=depth))
-        return response.json()
+        data = self.request('GET', rest_endpoint.VIEW_COMPACT(view_path=url_path)).json()
+        return self._compact_view(data)
+
+    def _compact_view(self, data: dict) -> dict:
+        """Project a view to names, urls and colours only, limited to the allowed folders.
+
+        Job parameters, builds and any other property of a job are never part of the result, whatever the depth.
+        """
+        view = {key: data[key] for key in ('name', 'url', 'description') if data.get(key)}
+        jobs = []
+        for job in data.get('jobs') or []:
+            fullname = self._queue_item_job(job.get('url') or '')
+            if self._allowed_folders and (fullname is None or not self._is_listed(fullname)):
+                continue
+            jobs.append(
+                {
+                    'name': job.get('name'),
+                    'url': job.get('url'),
+                    'color': job.get('color'),
+                    'kind': (job.get('_class') or '').rsplit('.', 1)[-1] or None,
+                }
+            )
+        if 'jobs' in data:
+            view['jobs'] = [{k: v for k, v in job.items() if v is not None} for job in jobs]
+        if data.get('views'):
+            view['views'] = [{'name': v.get('name'), 'url': v.get('url')} for v in data['views']]
+        return view
 
     def get_queue(self, *, depth: int = 1) -> Queue:
         """Get queue.
@@ -366,10 +393,7 @@ class Jenkins:
             The console output as a string.
         """
         job_path = self._job_path(fullname)
-        if pattern is not None and len(pattern) > self.MAX_PATTERN_LENGTH:
-            msg = f'pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
-            raise ValueError(msg)
-        compiled = re.compile(pattern) if pattern else None
+        compiled = compile_safe(pattern, name='pattern') if pattern else None
         effective_limit = min(limit, self.MAX_CONSOLE_LINES) if limit else self.MAX_CONSOLE_LINES
 
         response = self._session.get(
@@ -723,16 +747,16 @@ class Jenkins:
         except OSError as e:
             logger.warning(f'Could not write the audit log {self._audit_log}: {e}')
 
-    def _release_context(self, job_path: str) -> dict:
+    def _release_context(self, job_path: str) -> dict | None:
         """What starting a job will do beyond the job itself: branch, default parameters, downstream jobs.
 
-        Best effort: reading a job's config needs extra permission, and a failure just leaves it out.
+        Best effort: reading a job's config needs extra permission. Returns None when it could not be read.
         """
         try:
             config = self.request('GET', rest_endpoint.ITEM_CONFIG(job_path=job_path)).text
             summary = summarize_config(config)
         except (HTTPError, ET.ParseError, ValueError):
-            return {}
+            return None
         context = {}
         if summary.get('scm', {}).get('branches'):
             context['branches'] = summary['scm']['branches']
@@ -756,8 +780,15 @@ class Jenkins:
             raise PermissionError(msg)
         return fullname
 
-    def trigger_build(self, *, fullname: str, confirm: bool = False) -> dict:
-        """Start a build of one allowlisted job. The only write this server can make.
+    @staticmethod
+    def _context_digest(context: dict | None) -> str | None:
+        """A stable fingerprint of what a start would run, or None when the context could not be read."""
+        if context is None:
+            return None
+        return hashlib.sha256(json.dumps(context, sort_keys=True).encode('utf-8')).hexdigest()
+
+    def trigger_build(self, *, fullname: str, confirm: bool = False, context_digest: str | None = None) -> dict:
+        """Start a build of one allowlisted job.
 
         Disabled unless the server was started with allow_trigger, and limited to the exact job full names in
         trigger_jobs. Without confirm nothing is sent: the result only says what would be started.
@@ -765,10 +796,12 @@ class Jenkins:
         Args:
             fullname: The full name of the job (must be in the trigger allowlist).
             confirm: False (default) = dry run; True = really start the build.
+            context_digest: The `contextDigest` of the dry run the user approved. When given, the start is refused
+                if the job's branch, default parameters or downstream jobs changed since then.
 
         Returns:
-            A dict with job, action, parameterised, dryRun and, after a real start, queueItem and queueUrl.
-            A parameterised job is started with its default parameter values.
+            A dict with job, action, parameterised, dryRun, contextDigest and, after a real start, queueItem and
+            queueUrl. A parameterised job is started with its default parameter values.
         """
         fullname = self._require_release_job(fullname)
 
@@ -781,15 +814,25 @@ class Jenkins:
         parameterised = any(p.get('parameterDefinitions') for p in info.get('property') or [])
         action = 'buildWithParameters' if parameterised else 'build'
         result = {'job': fullname, 'action': action, 'parameterised': parameterised, 'dryRun': not confirm}
-        result.update(self._release_context(job_path))
+        context = self._release_context(job_path)
+        result.update(context or {})
+        result['contextDigest'] = self._context_digest(context)
         if not confirm:
             return result
 
+        if context_digest is not None and context_digest != result['contextDigest']:
+            msg = 'The job changed since the dry run (branch, parameters or downstream jobs): run the dry run again'
+            raise PermissionError(msg)
         if self._starts >= self._max_starts:
             msg = f'Start limit reached: at most {self._max_starts} confirmed starts per server session'
             raise PermissionError(msg)
-        response = self.request('POST', rest_endpoint.ITEM_TRIGGER(job_path=job_path, action=action))
+        # Count before sending: if the reply is lost after Jenkins accepted the request, the start still counts.
         self._starts += 1
+        try:
+            response = self.request('POST', rest_endpoint.ITEM_TRIGGER(job_path=job_path, action=action))
+        except Exception as e:
+            self._audit('trigger_build_failed', job=fullname, error=type(e).__name__)
+            raise
         location = response.headers.get('Location') or ''
         match = re.search(r'/queue/item/(\d+)/?$', location)
         result['queueItem'] = int(match.group(1)) if match else None
@@ -822,7 +865,11 @@ class Jenkins:
 
         result = {'job': fullname, 'number': number, 'action': 'stop', 'building': True, 'dryRun': not confirm}
         if confirm:
-            self.request('POST', rest_endpoint.BUILD_STOP(job_path=job_path, number=number))
+            try:
+                self.request('POST', rest_endpoint.BUILD_STOP(job_path=job_path, number=number))
+            except Exception as e:
+                self._audit('stop_build_failed', job=fullname, number=number, error=type(e).__name__)
+                raise
             self._audit('stop_build', job=fullname, number=number)
         return result
 
@@ -869,7 +916,11 @@ class Jenkins:
 
         result = {'queueItem': id, 'job': job, 'action': 'cancel', 'dryRun': not confirm}
         if confirm:
-            self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
+            try:
+                self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
+            except Exception as e:
+                self._audit('cancel_queue_item_failed', job=job, queueItem=id, error=type(e).__name__)
+                raise
             self._audit('cancel_queue_item', job=job, queueItem=id)
         return result
 
@@ -892,10 +943,7 @@ class Jenkins:
         Returns:
             One dict per job (folders are skipped): job, color, build, result, building, durationS, timestamp.
         """
-        if fullname_pattern is not None and len(fullname_pattern) > self.MAX_PATTERN_LENGTH:
-            msg = f'fullname_pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
-            raise ValueError(msg)
-        compiled = re.compile(fullname_pattern) if fullname_pattern else None
+        compiled = compile_safe(fullname_pattern, name='fullname_pattern') if fullname_pattern else None
         last_build = 'lastBuild[number,result,building,timestamp,duration]'
         query = reduce(
             lambda q, _: f'jobs[color,name,{last_build},{q}]',
@@ -1020,12 +1068,13 @@ class Jenkins:
         Returns:
             A list of ItemType objects matching the specified patterns.
         """
-        for pattern in (class_pattern, fullname_pattern, color_pattern):
-            if pattern and len(pattern) > self.MAX_PATTERN_LENGTH:
-                msg = f'pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
-                raise ValueError(msg)
         class_re, fullname_re, color_re = (
-            re.compile(pattern) if pattern else None for pattern in (class_pattern, fullname_pattern, color_pattern)
+            compile_safe(pattern, name=name) if pattern else None
+            for name, pattern in (
+                ('class_pattern', class_pattern),
+                ('fullname_pattern', fullname_pattern),
+                ('color_pattern', color_pattern),
+            )
         )
 
         items = self.get_items(folder_depth=folder_depth, folder_depth_per_request=folder_depth_per_request)

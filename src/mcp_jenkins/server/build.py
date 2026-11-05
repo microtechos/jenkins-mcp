@@ -4,7 +4,7 @@ from fastmcp import Context
 
 from mcp_jenkins.core.lifespan import jenkins
 from mcp_jenkins.jenkins import Jenkins
-from mcp_jenkins.jenkins.redact import redact_params, redact_text
+from mcp_jenkins.jenkins.redact import redact_data, redact_params, redact_text
 from mcp_jenkins.server import mcp
 
 
@@ -127,7 +127,7 @@ async def get_build_test_report(ctx: Context, fullname: str, number: int | None 
     """
     number = _resolve_build_number(jenkins(ctx), fullname, number)
 
-    return jenkins(ctx).get_build_test_report(fullname=fullname, number=number)
+    return redact_data(jenkins(ctx).get_build_test_report(fullname=fullname, number=number))
 
 
 @mcp.tool(tags=['read'])
@@ -155,11 +155,13 @@ async def get_build_test_failures(
     number = _resolve_build_number(jenkins(ctx), fullname, number)
     limit = 200 if limit is None else max(1, min(limit, 200))
 
-    return jenkins(ctx).get_build_test_failures(
-        fullname=fullname,
-        number=number,
-        limit=limit,
-        max_stack_trace_length=max_stack_trace_length,
+    return redact_data(
+        jenkins(ctx).get_build_test_failures(
+            fullname=fullname,
+            number=number,
+            limit=limit,
+            max_stack_trace_length=max_stack_trace_length,
+        )
     )
 
 
@@ -202,7 +204,7 @@ async def get_pending_inputs(ctx: Context, fullname: str, number: int | None = N
     number = _resolve_build_number(client, fullname, number)
 
     return [
-        pending_input.model_dump(exclude_none=True)
+        redact_data(pending_input.model_dump(exclude_none=True))
         for pending_input in client.get_build_pending_inputs(fullname=fullname, number=number)
     ]
 

@@ -164,7 +164,7 @@ def _tool_names(env):
     )
     out = subprocess.run(  # noqa: S603
         [sys.executable, '-W', 'ignore', '-c', code],
-        env={**os.environ, **env},
+        env={**{key: value for key, value in os.environ.items() if not key.lower().startswith('jenkins_')}, **env},
         capture_output=True,
         text=True,
         check=True,

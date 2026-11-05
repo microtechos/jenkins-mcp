@@ -303,7 +303,7 @@ class TestView:
 
         mock_session.request.assert_called_once_with(
             method='GET',
-            url='https://example.com/view/frontend/api/json?depth=0',
+            url='https://example.com/view/frontend/api/json?tree=name,url,description,jobs[_class,name,url,color],views[name,url]',
             headers={'Jenkins-Crumb': 'crumb-value'},
             params=None,
             data=None,
@@ -331,7 +331,7 @@ class TestView:
 
         mock_session.request.assert_called_once_with(
             method='GET',
-            url='https://example.com/view/frontend/view/nightly/view/nightly%20linux/api/json?depth=0',
+            url='https://example.com/view/frontend/view/nightly/view/nightly%20linux/api/json?tree=name,url,description,jobs[_class,name,url,color],views[name,url]',
             headers={'Jenkins-Crumb': 'crumb-value'},
             params=None,
             data=None,

@@ -76,7 +76,9 @@ def test_dry_run_is_the_default_and_sends_no_post(mocker, mock_session):
 
     result = make(mocker, allow_trigger=True, trigger_jobs=ALLOWED).trigger_build(fullname='Branch-Retail/cloud/web-a')
 
+    digest = result.pop('contextDigest')
     assert result == {'job': 'Branch-Retail/cloud/web-a', 'action': 'build', 'parameterised': False, 'dryRun': True}
+    assert len(digest) == 64
     assert not posts(mock_session)
 
 
@@ -131,7 +133,7 @@ def _tool_names(env):
     )
     out = subprocess.run(  # noqa: S603
         [sys.executable, '-W', 'ignore', '-c', code],
-        env={**os.environ, **env},
+        env={**{key: value for key, value in os.environ.items() if not key.lower().startswith('jenkins_')}, **env},
         capture_output=True,
         text=True,
         check=True,

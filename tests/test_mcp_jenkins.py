@@ -163,3 +163,25 @@ def test_main_allowed_folders(mocker, monkeypatch):
 
     assert result.exit_code == 0
     assert os.environ['jenkins_allowed_folders'] == 'Branch-Retail,Branch-Salon'
+
+
+def test_approval_can_not_be_switched_off_from_the_environment(mocker, monkeypatch):
+    mocker.patch('mcp_jenkins.asyncio')
+    mocker.patch('mcp_jenkins.server.mcp')
+    monkeypatch.setenv('JENKINS_REQUIRE_APPROVAL', 'false')
+    monkeypatch.setenv('jenkins_require_approval', 'false')
+
+    result = CliRunner().invoke(main, ['--transport', 'stdio'])
+
+    assert result.exit_code == 0
+    assert os.environ['jenkins_require_approval'] == 'true'
+
+
+def test_approval_is_switched_off_only_by_the_flag(mocker):
+    mocker.patch('mcp_jenkins.asyncio')
+    mocker.patch('mcp_jenkins.server.mcp')
+
+    result = CliRunner().invoke(main, ['--transport', 'stdio', '--no-require-approval'])
+
+    assert result.exit_code == 0
+    assert os.environ['jenkins_require_approval'] == 'false'

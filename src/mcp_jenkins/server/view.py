@@ -26,9 +26,10 @@ async def get_view(ctx: Context, view_path: str, depth: int = 0) -> dict:
         view_path: View path using "/" to separate levels.
                    Examples: "All", "frontend", "frontend/nightly".
                    Spaces and special characters in view names are handled automatically.
-        depth: Depth of detail to retrieve for each job. Default is 0.
+        depth: Accepted for compatibility and ignored: views are always returned compact.
 
     Returns:
-        A dict with the view's name, jobs list, and/or nested views.
+        A dict with the view's name, its jobs (name, url, color, kind) and/or nested views (name, url). Jobs
+        outside the allowed folders are left out, and job parameters or builds are never included.
     """
     return jenkins(ctx).get_view(view_path=view_path, depth=max(0, min(depth, 3)))
