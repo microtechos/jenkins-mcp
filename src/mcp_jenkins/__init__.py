@@ -59,6 +59,13 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
     help='Comma-separated exact job full names trigger_build may start. Empty = none can be started.',
 )
 @click.option(
+    '--stop-jobs',
+    default='',
+    envvar='JENKINS_STOP_JOBS',
+    help='Comma-separated exact job full names that stop_build and cancel_queue_item may also act on '
+    '(for example the rest of a release chain). They can never be started by trigger_build.',
+)
+@click.option(
     '--read-only',
     default=True,
     is_flag=True,
@@ -92,6 +99,7 @@ def main(
     allowed_folders: str,
     allow_trigger: bool,  # noqa: FBT001
     trigger_jobs: str,
+    stop_jobs: str,
     read_only: bool,  # noqa: ARG001, FBT001
     tool_regex: str,
     jenkins_session_singleton: bool,  # noqa: FBT001
@@ -110,6 +118,7 @@ def main(
     os.environ['jenkins_allowed_folders'] = allowed_folders
     os.environ['jenkins_allow_trigger'] = str(allow_trigger).lower()
     os.environ['jenkins_trigger_jobs'] = trigger_jobs
+    os.environ['jenkins_stop_jobs'] = stop_jobs
 
     from mcp_jenkins.server import mcp
 

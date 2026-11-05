@@ -52,11 +52,15 @@ class Jenkins:
         allowed_folders: str = '',
         allow_trigger: bool = False,
         trigger_jobs: str = '',
+        stop_jobs: str = '',
     ) -> None:
         self.url = url
         self._allowed_folders = tuple(p for p in (x.strip().strip('/') for x in allowed_folders.split(',')) if p)
         self._allow_trigger = allow_trigger
         self._trigger_jobs = frozenset(p for p in (x.strip().strip('/') for x in trigger_jobs.split(',')) if p)
+        # stop_build and cancel_queue_item may also act on these (the rest of a release chain), never trigger_build
+        extra_stop = frozenset(p for p in (x.strip().strip('/') for x in stop_jobs.split(',')) if p)
+        self._stop_jobs = self._trigger_jobs | extra_stop
         self.timeout = timeout
 
         self._crumb_header = None
@@ -694,12 +698,17 @@ class Jenkins:
             msg = 'Starting and stopping builds is disabled: start with --allow-trigger (JENKINS_ALLOW_TRIGGER=true)'
             raise PermissionError(msg)
 
-    def _require_release_job(self, fullname: str) -> str:
-        """The opt-in switch, then the exact job allowlist. Returns the normalised name."""
+    def _require_release_job(self, fullname: str, *, undo: bool = False) -> str:
+        """The opt-in switch, then the exact job allowlist. Returns the normalised name.
+
+        Starting is limited to the trigger jobs; stopping and cancelling (undo) also covers the stop jobs.
+        """
         self._require_trigger_enabled()
         fullname = fullname.strip().strip('/')
-        if fullname not in self._trigger_jobs:
-            msg = f'{fullname!r} is not in the trigger allowlist ({len(self._trigger_jobs)} job(s) allowed)'
+        allowed = self._stop_jobs if undo else self._trigger_jobs
+        if fullname not in allowed:
+            kind = 'stop' if undo else 'trigger'
+            msg = f'{fullname!r} is not in the {kind} allowlist ({len(allowed)} job(s) allowed)'
             raise PermissionError(msg)
         return fullname
 
@@ -749,7 +758,7 @@ class Jenkins:
         Returns:
             A dict with job, number, action, building and dryRun.
         """
-        fullname = self._require_release_job(fullname)
+        fullname = self._require_release_job(fullname, undo=True)
         job_path = self._job_path(fullname)
         number = int(number)
         if number < 1:
@@ -803,8 +812,8 @@ class Jenkins:
             raise
 
         job = self._queue_item_job((item.get('task') or {}).get('url') or '')
-        if job is None or job not in self._trigger_jobs:
-            msg = f'Queue item {id} belongs to {job or "an unknown task"}, which is not in the trigger allowlist'
+        if job is None or job not in self._stop_jobs:
+            msg = f'Queue item {id} belongs to {job or "an unknown task"}, which is not in the stop allowlist'
             raise PermissionError(msg)
 
         result = {'queueItem': id, 'job': job, 'action': 'cancel', 'dryRun': not confirm}

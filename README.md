@@ -43,7 +43,8 @@ uvx --from git+https://github.com/microtechos/jenkins-mcp@<tag-or-sha> mcp-jenki
 | `--jenkins-timeout` | `JENKINS_TIMEOUT` | Seconds per request, default 5 |
 | `--jenkins-verify-ssl/--no-jenkins-verify-ssl` | `JENKINS_VERIFY_SSL` | TLS verification, default on |
 | `--allow-trigger` | `JENKINS_ALLOW_TRIGGER` | Register `trigger_build`, `stop_build` and `cancel_queue_item` (default off) |
-| `--trigger-jobs` | `JENKINS_TRIGGER_JOBS` | Comma-separated exact job full names the three tools may act on. Empty = none |
+| `--trigger-jobs` | `JENKINS_TRIGGER_JOBS` | Comma-separated exact job full names `trigger_build` may start (and the other two may stop or cancel). Empty = none |
+| `--stop-jobs` | `JENKINS_STOP_JOBS` | Extra exact job full names that only `stop_build` and `cancel_queue_item` may act on, e.g. the rest of a release chain. They can never be started |
 | `--allowed-folders` | `JENKINS_ALLOWED_FOLDERS` | Comma-separated folder/job full names that may be read, e.g. `Branch-Retail,Branch-Salon`. Empty = no restriction |
 | `--env-file` | | Load the settings above from a file (never auto-discovered) |
 

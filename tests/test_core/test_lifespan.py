@@ -64,6 +64,7 @@ class TestJenkins:
                 'jenkins_allowed_folders': '',
                 'jenkins_allow_trigger': False,
                 'jenkins_trigger_jobs': '',
+                'jenkins_stop_jobs': '',
                 'jenkins_session_singleton': True,
             }
             values.update(overrides)
@@ -80,6 +81,7 @@ class TestJenkins:
             jenkins_verify_ssl=False,
             jenkins_allow_trigger=True,
             jenkins_trigger_jobs='F/job',
+            jenkins_stop_jobs='F/chain',
         )
 
         result = jenkins(ctx)
@@ -93,6 +95,7 @@ class TestJenkins:
             allowed_folders='Branch-Retail',
             allow_trigger=True,
             trigger_jobs='F/job',
+            stop_jobs='F/chain',
         )
         assert result is ctx.session.jenkins
 

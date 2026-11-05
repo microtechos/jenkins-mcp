@@ -51,7 +51,7 @@ class TestStopBuild:
 
     @pytest.mark.parametrize('fullname', ['Branch-Retail/cloud', 'Branch-Retail/cloud/web-b', 'other/job', ''])
     def test_job_outside_the_list_is_refused(self, mocker, mock_session, fullname):
-        with pytest.raises(PermissionError, match='not in the trigger allowlist'):
+        with pytest.raises(PermissionError, match='not in the stop allowlist'):
             make(mocker).stop_build(fullname=fullname, number=3, confirm=True)
 
         assert mock_session.request.call_count == 0
@@ -122,7 +122,7 @@ class TestCancelQueueItem:
     def test_item_of_another_job_is_refused_and_nothing_is_sent(self, mocker, mock_session):
         respond(mocker, mock_session, self.task(name='06-server', path='Branch-Retail/job/cloud/job'))
 
-        with pytest.raises(PermissionError, match='not in the trigger allowlist'):
+        with pytest.raises(PermissionError, match='not in the stop allowlist'):
             make(mocker).cancel_queue_item(id=42, confirm=True)
 
         assert not posts(mock_session)
@@ -139,7 +139,7 @@ class TestCancelQueueItem:
     def test_item_with_a_task_that_is_not_one_of_our_jobs_is_refused(self, mocker, mock_session, url):
         respond(mocker, mock_session, {'id': 42, 'task': {'url': url}})
 
-        with pytest.raises(PermissionError, match='not in the trigger allowlist'):
+        with pytest.raises(PermissionError, match='not in the stop allowlist'):
             make(mocker).cancel_queue_item(id=42, confirm=True)
 
         assert not posts(mock_session)
@@ -179,3 +179,42 @@ def test_the_write_tools_exist_only_when_enabled():
     assert not off & {'trigger_build', 'stop_build', 'cancel_queue_item'}
     assert {'trigger_build', 'stop_build', 'cancel_queue_item'} <= on
     assert not on & {'build_item', 'set_item_config', 'set_node_config', 'run_groovy_script'}
+
+
+CHAIN = 'Branch-Retail/cloud/06-server'
+
+
+class TestStopJobs:
+    def test_stop_build_accepts_a_chain_job_from_the_stop_list(self, mocker, mock_session):
+        respond(mocker, mock_session, {'number': 4, 'building': True})
+
+        result = make(mocker, stop_jobs=CHAIN).stop_build(fullname=CHAIN, number=4, confirm=True)
+
+        assert result['job'] == CHAIN
+        [post] = posts(mock_session)
+        assert post['url'].endswith('/job/06-server/4/stop')
+
+    def test_trigger_build_never_accepts_a_stop_only_job(self, mocker, mock_session):
+        with pytest.raises(PermissionError, match='not in the trigger allowlist'):
+            make(mocker, stop_jobs=CHAIN).trigger_build(fullname=CHAIN, confirm=True)
+
+        assert mock_session.request.call_count == 0
+
+    def test_cancel_queue_item_accepts_a_chain_job_from_the_stop_list(self, mocker, mock_session):
+        respond(mocker, mock_session, {'id': 9, 'task': {'url': f'{BASE}/job/Branch-Retail/job/cloud/job/06-server/'}})
+
+        result = make(mocker, stop_jobs=CHAIN).cancel_queue_item(id=9, confirm=True)
+
+        assert result['job'] == CHAIN
+        assert len(posts(mock_session)) == 1
+
+    def test_trigger_jobs_can_also_be_stopped(self, mocker, mock_session):
+        respond(mocker, mock_session, {'number': 4, 'building': True})
+
+        assert make(mocker, stop_jobs=CHAIN).stop_build(fullname=JOB, number=4)['job'] == JOB
+
+    def test_a_job_in_neither_list_is_refused(self, mocker, mock_session):
+        with pytest.raises(PermissionError, match='not in the stop allowlist'):
+            make(mocker, stop_jobs=CHAIN).stop_build(fullname='Other/job', number=4, confirm=True)
+
+        assert mock_session.request.call_count == 0
