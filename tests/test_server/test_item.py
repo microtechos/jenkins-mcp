@@ -22,20 +22,8 @@ async def test_get_all_items(mock_jenkins, mocker):
     ]
 
     assert await item.get_all_items(mocker.Mock()) == [
-        {
-            'class_': 'Job',
-            'color': 'blue',
-            'fullname': 'job1',
-            'name': 'job1',
-            'url': '1',
-        },
-        {
-            'class_': 'Folder',
-            'fullname': 'job2',
-            'jobs': [],
-            'name': 'folder',
-            'url': '1',
-        },
+        {'fullname': 'job1', 'kind': 'Job', 'color': 'blue'},
+        {'fullname': 'job2', 'kind': 'Folder'},
     ]
 
 
@@ -71,13 +59,7 @@ async def test_query_items(mock_jenkins, mocker):
         fullname_pattern='job.*',
         color_pattern='blue',
     ) == [
-        {
-            'class_': 'Job',
-            'color': 'blue',
-            'fullname': 'job1',
-            'name': 'job1',
-            'url': '1',
-        },
+        {'fullname': 'job1', 'kind': 'Job', 'color': 'blue'},
     ]
 
 
@@ -172,3 +154,53 @@ async def test_get_item_parameters_missing_fields(mock_jenkins, mocker):
             'description': '',
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_query_items_fields_projection_and_no_nested_children(mock_jenkins, mocker):
+    child = Job(fullname='f/job1', color='red', name='job1', url='u1', class_='hudson.model.FreeStyleProject')
+    folder = Folder(fullname='f', jobs=[child], class_='Folder', name='f', url='u0')
+    mock_jenkins.query_items.return_value = [folder, child]
+
+    rows = await item.query_items(mocker.Mock(), fields=['fullname', 'url'])
+
+    assert rows == [{'fullname': 'f', 'url': 'u0'}, {'fullname': 'f/job1', 'url': 'u1'}]
+
+
+@pytest.mark.asyncio
+async def test_query_items_rejects_unknown_field(mock_jenkins, mocker):
+    mock_jenkins.query_items.return_value = []
+
+    with pytest.raises(ValueError, match='Unknown field'):
+        await item.query_items(mocker.Mock(), fields=['fullname', 'jobs'])
+
+
+@pytest.mark.asyncio
+async def test_query_items_is_capped_with_a_marker(mock_jenkins, mocker):
+    mock_jenkins.query_items.return_value = [
+        Job(fullname=f'j{i}', color='blue', name=f'j{i}', url='u', class_='Job') for i in range(5)
+    ]
+
+    rows = await item.query_items(mocker.Mock(), limit=2)
+
+    assert [r.get('fullname') for r in rows[:2]] == ['j0', 'j1']
+    assert rows[2]['truncated'] is True
+    assert (rows[2]['shown'], rows[2]['total']) == (2, 5)
+
+
+@pytest.mark.asyncio
+async def test_get_jobs_status_returns_rows_and_caps(mock_jenkins, mocker):
+    mock_jenkins.get_jobs_status.return_value = [{'job': f'j{i}', 'build': i} for i in range(3)]
+
+    rows = await item.get_jobs_status(mocker.Mock(), fullname_pattern='^j', folder_depth=2, limit=2)
+
+    mock_jenkins.get_jobs_status.assert_called_once_with(fullname_pattern='^j', folder_depth=2)
+    assert rows[:2] == [{'job': 'j0', 'build': 0}, {'job': 'j1', 'build': 1}]
+    assert rows[2]['truncated'] is True
+
+
+@pytest.mark.asyncio
+async def test_get_item_summary_uses_the_config(mock_jenkins, mocker):
+    mock_jenkins.get_item_config.return_value = '<project><disabled>true</disabled></project>'
+
+    assert await item.get_item_summary(mocker.Mock(), fullname='j') == {'kind': 'project', 'disabled': True}

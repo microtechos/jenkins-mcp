@@ -20,7 +20,8 @@ do not run it by hand: the plugin's `.mcp.json` starts it and supplies the crede
 | `.env` | Auto-loaded from the working directory | Only with an explicit `--env-file` | A stray file can not silently change credentials |
 | Job and artifact paths | Inserted into URLs unchecked | Segments validated and URL-quoted; `..`, `?`, `#`, `%`, `\`, control characters refused | Stops a crafted name reaching other URLs |
 | Scope | Whole instance | Optional `--allowed-folders` | Limit reads to the folders you care about |
-| Output size | Unbounded | Console 5000 lines, 2000 chars per line, regex up to 200 chars, artifacts 5 MiB | One call can not flood a model's context |
+| Output size | Unbounded | Console 5000 lines, 2000 chars per line, regex up to 200 chars, artifacts 5 MiB; listings are compact by default (`fullname`, `kind`, `color`, max 200 rows, `fields` and `limit` to change) | One call can not flood a model's context |
+| Recipe tools | none | `get_jobs_status` (last build of many jobs, one request) and `get_item_summary` (a job's repo, branch, steps, triggers, downstream in ~1 KB) | Replace N+1 calls and raw `config.xml` dumps |
 | `get_item_config` | Raw `config.xml` | Secret-looking values replaced by `[REDACTED]` (best effort) | Config files can hold tokens |
 | File logging | Wrote the URL and username to `~/.mcp_jenkins/log.log` | None | No credentials metadata on disk |
 | `list_builds` | Missing | Added | Build history of a job, newest first |
@@ -52,19 +53,19 @@ instance-level metadata and are not filtered: for a hard boundary also give the 
 permissions it needs (Overall/Read, Job/Read on the folders, Job/ExtendedRead only if `get_item_config`
 is wanted).
 
-## Tools (29 read-only, plus 3 opt-in tools when enabled)
+## Tools (31 read-only, plus 3 opt-in tools when enabled)
 
 | Group | Tools |
 | --- | --- |
-| Items | `get_item`, `get_item_config`, `get_item_parameters`, `get_all_items`, `query_items` |
-| Builds | `list_builds`, `get_build`, `get_build_parameters`, `get_build_console_output`, `get_build_scripts`, `get_build_test_report`, `get_build_test_failures`, `get_running_builds`, `get_pending_inputs` |
+| Items | `get_item`, `get_item_summary`, `get_item_config`, `get_item_parameters`, `get_all_items`, `query_items` |
+| Builds | `get_jobs_status`, `list_builds`, `get_build`, `get_build_parameters`, `get_build_console_output`, `get_build_scripts`, `get_build_test_report`, `get_build_test_failures`, `get_running_builds`, `get_pending_inputs` |
 | Artifacts | `get_all_build_artifacts`, `get_build_artifact`, `get_build_artifact_url` |
 | Views / queue / nodes | `get_all_views`, `get_view`, `get_all_queue_items`, `get_queue_item`, `get_all_nodes`, `get_node` |
 | Plugins | `get_all_plugins`, `get_plugin`, `get_plugins_with_problems`, `get_plugins_with_updates`, `get_plugins_with_backup`, `get_plugin_dependency_graph` |
 | Trigger (opt-in) | `trigger_build(fullname, confirm=false)`, `stop_build(fullname, number, confirm=false)`, `cancel_queue_item(id, confirm=false)` |
 
-`get_all_items` and an unfiltered `query_items` return very large results on a big instance: prefer
-`query_items` with `fullname_pattern` and `folder_depth`.
+Listings (`get_all_items`, `query_items`) are compact by default; for status use `get_jobs_status` and for a job's
+configuration `get_item_summary` before `get_item_config`.
 
 ## Maintaining this fork
 

@@ -812,6 +812,67 @@ class Jenkins:
             self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
         return result
 
+    def get_jobs_status(
+        self,
+        *,
+        fullname_pattern: str | None = None,
+        folder_depth: int | None = None,
+        folder_depth_per_request: int = 10,
+    ) -> list[dict]:
+        """Last build of every job whose full name matches a pattern, in one request.
+
+        Replaces "list the jobs, then list_builds for each": the last build is part of the listing query.
+
+        Args:
+            fullname_pattern: Regex searched in the job full name (None = every job).
+            folder_depth: The maximum depth of folders to traverse. If None, traverses all levels.
+            folder_depth_per_request: The depth of folders to request per API call.
+
+        Returns:
+            One dict per job (folders are skipped): job, color, build, result, building, durationS, timestamp.
+        """
+        if fullname_pattern is not None and len(fullname_pattern) > self.MAX_PATTERN_LENGTH:
+            msg = f'fullname_pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
+            raise ValueError(msg)
+        compiled = re.compile(fullname_pattern) if fullname_pattern else None
+        last_build = 'lastBuild[number,result,building,timestamp,duration]'
+        query = reduce(
+            lambda q, _: f'jobs[color,name,{last_build},{q}]',
+            range(folder_depth_per_request),
+            'jobs',
+        )
+        response = self.request('GET', rest_endpoint.ITEMS(folder='', query=query))
+
+        rows = []
+        item_stack = [(0, [], response.json()['jobs'])]
+        for level, path, level_items in item_stack:
+            for item in level_items if isinstance(level_items, list) else [level_items]:
+                job_path = path + [item['name']]
+                fullname = '/'.join(job_path)
+                children = item.get('jobs')
+                if isinstance(children, list):
+                    if folder_depth is None or level < folder_depth:
+                        item_stack.append((level + 1, job_path, children))
+                    continue
+                if self._allowed_folders and not self._is_listed(fullname):
+                    continue
+                if compiled and not compiled.search(fullname):
+                    continue
+                build = item.get('lastBuild') or {}
+                duration = build.get('duration')
+                rows.append(
+                    {
+                        'job': fullname,
+                        'color': item.get('color'),
+                        'build': build.get('number'),
+                        'result': build.get('result'),
+                        'building': build.get('building'),
+                        'durationS': round(duration / 1000) if duration else None,
+                        'timestamp': build.get('timestamp'),
+                    }
+                )
+        return rows
+
     def get_builds(self, *, fullname: str, limit: int = 20) -> list[dict]:
         """List the most recent builds of a job, newest first.
 
