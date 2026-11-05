@@ -6,12 +6,20 @@ from mcp_jenkins.server import mcp
 
 @mcp.tool(tags=['read'])
 async def get_all_queue_items(ctx: Context) -> list[dict]:
-    """Get all items in Jenkins queue
+    """Get all items in Jenkins queue, each with the job it belongs to (name and url)
 
     Returns:
         A list of all items in the Jenkins queue
     """
-    return [item.model_dump(exclude_none=True, exclude={'task'}) for item in jenkins(ctx).get_queue().items]
+    rows = []
+    for item in jenkins(ctx).get_queue().items:
+        row = item.model_dump(exclude_none=True, exclude={'task'})
+        if item.task.name:
+            row['name'] = item.task.name
+        if item.task.url:
+            row['job'] = item.task.url
+        rows.append(row)
+    return rows
 
 
 @mcp.tool(tags=['read'])

@@ -5,7 +5,7 @@ Pure functions: no network, no Jenkins client. The server tools call them on wha
 
 import xml.etree.ElementTree as ET
 
-from mcp_jenkins.jenkins.redact import redact_config_xml
+from mcp_jenkins.jenkins.redact import redact_config_xml, redact_parameter_default
 
 ALLOWED_FIELDS = ('fullname', 'name', 'kind', 'class_', 'url', 'color')
 DEFAULT_FIELDS = ('fullname', 'kind', 'color')
@@ -120,13 +120,9 @@ def summarize_config(config_xml: str) -> dict:
     parameters = []
     for definitions in root.iter('parameterDefinitions'):
         for definition in definitions:
-            parameters.append(
-                {
-                    'name': (definition.findtext('name') or '').strip(),
-                    'type': _short(definition.tag),
-                    'default': _clip(definition.findtext('defaultValue'), 80),
-                }
-            )
+            name = (definition.findtext('name') or '').strip()
+            default = redact_parameter_default(definition.tag, name, definition.findtext('defaultValue'))
+            parameters.append({'name': name, 'type': _short(definition.tag), 'default': _clip(default, 80)})
     if parameters:
         summary['parameters'] = parameters
 

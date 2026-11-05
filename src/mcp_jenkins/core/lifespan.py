@@ -1,6 +1,7 @@
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastmcp import Context, FastMCP
 from pydantic import BaseModel, ConfigDict
@@ -20,6 +21,8 @@ class LifespanContext(BaseModel):
     jenkins_allow_trigger: bool = False
     jenkins_trigger_jobs: str = ''
     jenkins_stop_jobs: str = ''
+    jenkins_audit_log: str = ''
+    jenkins_max_starts: int = 5
 
     jenkins_session_singleton: bool = True
 
@@ -37,6 +40,8 @@ async def lifespan(app: FastMCP[LifespanContext]) -> AsyncIterator['LifespanCont
     jenkins_allow_trigger = os.getenv('jenkins_allow_trigger', 'false').lower() == 'true'
     jenkins_trigger_jobs = os.getenv('jenkins_trigger_jobs', '')
     jenkins_stop_jobs = os.getenv('jenkins_stop_jobs', '')
+    jenkins_audit_log = os.getenv('jenkins_audit_log', '')
+    jenkins_max_starts = int(os.getenv('jenkins_max_starts', '5'))
 
     yield LifespanContext(
         jenkins_url=jenkins_url,
@@ -48,6 +53,8 @@ async def lifespan(app: FastMCP[LifespanContext]) -> AsyncIterator['LifespanCont
         jenkins_allow_trigger=jenkins_allow_trigger,
         jenkins_trigger_jobs=jenkins_trigger_jobs,
         jenkins_stop_jobs=jenkins_stop_jobs,
+        jenkins_audit_log=jenkins_audit_log,
+        jenkins_max_starts=jenkins_max_starts,
         jenkins_session_singleton=jenkins_session_singleton,
     )
 
@@ -77,6 +84,11 @@ def jenkins(ctx: Context) -> Jenkins:
         )
         raise ValueError(msg)
 
+    parts = urlsplit(jenkins_url)
+    if parts.username or parts.password:
+        msg = 'The Jenkins URL must not contain credentials: pass them as username and password'
+        raise ValueError(msg)
+
     ctx.session.jenkins = Jenkins(
         url=jenkins_url,
         username=jenkins_username,
@@ -87,6 +99,8 @@ def jenkins(ctx: Context) -> Jenkins:
         allow_trigger=lifespan_context.jenkins_allow_trigger,
         trigger_jobs=lifespan_context.jenkins_trigger_jobs,
         stop_jobs=lifespan_context.jenkins_stop_jobs,
+        audit_log=lifespan_context.jenkins_audit_log,
+        max_starts=lifespan_context.jenkins_max_starts,
     )
 
     return ctx.session.jenkins

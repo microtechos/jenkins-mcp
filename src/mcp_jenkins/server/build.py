@@ -4,6 +4,7 @@ from fastmcp import Context
 
 from mcp_jenkins.core.lifespan import jenkins
 from mcp_jenkins.jenkins import Jenkins
+from mcp_jenkins.jenkins.redact import redact_params, redact_text
 from mcp_jenkins.server import mcp
 
 
@@ -79,7 +80,7 @@ async def get_build_scripts(ctx: Context, fullname: str, number: int | None = No
     """
     number = _resolve_build_number(jenkins(ctx), fullname, number)
 
-    return jenkins(ctx).get_build_replay(fullname=fullname, number=number).scripts
+    return [redact_text(script) for script in jenkins(ctx).get_build_replay(fullname=fullname, number=number).scripts]
 
 
 @mcp.tool(tags=['read'])
@@ -145,13 +146,14 @@ async def get_build_test_failures(
     Args:
         fullname: The fullname of the job
         number: The number of the build, if None, get the last build
-        limit: Maximum number of failures to return, None for all of them
+        limit: Maximum number of failures to return, 1-200 (None means 200)
         max_stack_trace_length: Stack traces longer than this are cut to this many characters
 
     Returns:
         The test counts of the build, its failures and whether the failures were truncated to the limit
     """
     number = _resolve_build_number(jenkins(ctx), fullname, number)
+    limit = 200 if limit is None else max(1, min(limit, 200))
 
     return jenkins(ctx).get_build_test_failures(
         fullname=fullname,
@@ -174,7 +176,7 @@ async def get_build_parameters(ctx: Context, fullname: str, number: int | None =
     """
     number = _resolve_build_number(jenkins(ctx), fullname, number)
 
-    return jenkins(ctx).get_build_parameters(fullname=fullname, number=number)
+    return redact_params(jenkins(ctx).get_build_parameters(fullname=fullname, number=number))
 
 
 @mcp.tool(tags=['read'])

@@ -26,6 +26,17 @@ async def test_get_all_queue_items(mock_jenkins, mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_all_queue_items_names_the_job(mock_jenkins, mocker):
+    task = QueueItemTask(name='web-a', url='https://j/job/F/job/web-a/')
+    item = QueueItem(id=7, inQueueSince=1, url='u', why='w', task=task)
+    mock_jenkins.get_queue.return_value = Queue(discoverableItems=[], items=[item])
+
+    [row] = await queue.get_all_queue_items(mocker.Mock())
+
+    assert (row['name'], row['job']) == ('web-a', 'https://j/job/F/job/web-a/')
+
+
+@pytest.mark.asyncio
 async def test_get_queue_item(mock_jenkins, mocker):
     q_item = QueueItem(
         id=1,

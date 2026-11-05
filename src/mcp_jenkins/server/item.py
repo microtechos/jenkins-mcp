@@ -9,7 +9,7 @@ from mcp_jenkins.jenkins.compact import (
     compact_rows,
     summarize_config,
 )
-from mcp_jenkins.jenkins.redact import redact_config_xml
+from mcp_jenkins.jenkins.redact import redact_config_xml, redact_parameter_default
 from mcp_jenkins.server import mcp
 
 
@@ -145,10 +145,11 @@ async def get_item_parameters(ctx: Context, fullname: str) -> list[dict]:
     params = []
     for param in root.iter('parameterDefinitions'):
         for definition in param:
+            name = definition.findtext('name', '')
             entry = {
-                'name': definition.findtext('name', ''),
+                'name': name,
                 'type': definition.tag,
-                'defaultValue': definition.findtext('defaultValue', ''),
+                'defaultValue': redact_parameter_default(definition.tag, name, definition.findtext('defaultValue', '')),
                 'description': definition.findtext('description', ''),
             }
             params.append(entry)

@@ -21,13 +21,16 @@ def make(mocker, **kwargs: object):
     return Jenkins(url='https://example.com/', username='u', password='p', **kwargs)
 
 
-def respond(mocker, session, *, buildable=True, parameterised=False, location=''):
+def respond(mocker, session, *, buildable=True, parameterised=False, location='', config='<project/>'):
     info = {'buildable': buildable, 'property': [{'parameterDefinitions': [{'name': 'X'}]}] if parameterised else []}
-    session.request.side_effect = lambda **kw: (
-        mocker.Mock(json=lambda: info)
-        if kw['method'] == 'GET'
-        else mocker.Mock(headers={'Location': location} if location else {})
-    )
+    def handler(**kw: object):
+        if kw['method'] == 'GET':
+            if str(kw['url']).endswith('/config.xml'):
+                return mocker.Mock(text=config)
+            return mocker.Mock(json=lambda: info)
+        return mocker.Mock(headers={'Location': location} if location else {})
+
+    session.request.side_effect = handler
 
 
 def posts(session):

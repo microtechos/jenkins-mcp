@@ -65,6 +65,8 @@ class TestJenkins:
                 'jenkins_allow_trigger': False,
                 'jenkins_trigger_jobs': '',
                 'jenkins_stop_jobs': '',
+                'jenkins_audit_log': '',
+                'jenkins_max_starts': 5,
                 'jenkins_session_singleton': True,
             }
             values.update(overrides)
@@ -96,6 +98,8 @@ class TestJenkins:
             allow_trigger=True,
             trigger_jobs='F/job',
             stop_jobs='F/chain',
+            audit_log='',
+            max_starts=5,
         )
         assert result is ctx.session.jenkins
 

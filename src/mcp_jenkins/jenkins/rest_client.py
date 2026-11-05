@@ -1,5 +1,9 @@
+import json
 import re
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from functools import reduce
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, unquote
 
@@ -11,6 +15,7 @@ from requests.auth import HTTPBasicAuth
 from requests.exceptions import HTTPError
 
 from mcp_jenkins.jenkins import rest_endpoint
+from mcp_jenkins.jenkins.compact import summarize_config
 from mcp_jenkins.jenkins.model.build import Artifact, Build, BuildReplay, PendingInput
 from mcp_jenkins.jenkins.model.item import (
     FreeStyleProject,
@@ -20,6 +25,7 @@ from mcp_jenkins.jenkins.model.item import (
 )
 from mcp_jenkins.jenkins.model.node import Node
 from mcp_jenkins.jenkins.model.queue import Queue, QueueItem
+from mcp_jenkins.jenkins.redact import redact_text
 
 
 class PendingInputsUnavailableError(ValueError):
@@ -53,10 +59,16 @@ class Jenkins:
         allow_trigger: bool = False,
         trigger_jobs: str = '',
         stop_jobs: str = '',
+        audit_log: str = '',
+        max_starts: int = 5,
     ) -> None:
         self.url = url
         self._allowed_folders = tuple(p for p in (x.strip().strip('/') for x in allowed_folders.split(',')) if p)
         self._allow_trigger = allow_trigger
+        self._username = username
+        self._audit_log = Path(audit_log) if audit_log else None
+        self._max_starts = max_starts
+        self._starts = 0
         self._trigger_jobs = frozenset(p for p in (x.strip().strip('/') for x in trigger_jobs.split(',')) if p)
         # stop_build and cancel_queue_item may also act on these (the rest of a release chain), never trigger_build
         extra_stop = frozenset(p for p in (x.strip().strip('/') for x in stop_jobs.split(',')) if p)
@@ -383,7 +395,7 @@ class Jenkins:
             if skipped < offset:
                 skipped += 1
                 continue
-            matched.append(raw_line)
+            matched.append(redact_text(raw_line))
             if len(matched) >= effective_limit:
                 truncated = limit is None or limit > self.MAX_CONSOLE_LINES
                 break
@@ -698,6 +710,38 @@ class Jenkins:
             msg = 'Starting and stopping builds is disabled: start with --allow-trigger (JENKINS_ALLOW_TRIGGER=true)'
             raise PermissionError(msg)
 
+    def _audit(self, action: str, **fields: object) -> None:
+        """Append one JSON line for a confirmed write (who, what, when). Never contains secrets."""
+        if self._audit_log is None:
+            return
+        stamp = datetime.now(UTC).isoformat(timespec='seconds')
+        record = {'ts': stamp, 'action': action, 'user': self._username, **fields}
+        try:
+            self._audit_log.parent.mkdir(parents=True, exist_ok=True)
+            with self._audit_log.open('a', encoding='utf-8') as handle:
+                handle.write(json.dumps(record) + '\n')
+        except OSError as e:
+            logger.warning(f'Could not write the audit log {self._audit_log}: {e}')
+
+    def _release_context(self, job_path: str) -> dict:
+        """What starting a job will do beyond the job itself: branch, default parameters, downstream jobs.
+
+        Best effort: reading a job's config needs extra permission, and a failure just leaves it out.
+        """
+        try:
+            config = self.request('GET', rest_endpoint.ITEM_CONFIG(job_path=job_path)).text
+            summary = summarize_config(config)
+        except (HTTPError, ET.ParseError, ValueError):
+            return {}
+        context = {}
+        if summary.get('scm', {}).get('branches'):
+            context['branches'] = summary['scm']['branches']
+        if summary.get('parameters'):
+            context['parameters'] = summary['parameters']
+        if summary.get('downstream'):
+            context['downstream'] = summary['downstream']
+        return context
+
     def _require_release_job(self, fullname: str, *, undo: bool = False) -> str:
         """The opt-in switch, then the exact job allowlist. Returns the normalised name.
 
@@ -737,14 +781,20 @@ class Jenkins:
         parameterised = any(p.get('parameterDefinitions') for p in info.get('property') or [])
         action = 'buildWithParameters' if parameterised else 'build'
         result = {'job': fullname, 'action': action, 'parameterised': parameterised, 'dryRun': not confirm}
+        result.update(self._release_context(job_path))
         if not confirm:
             return result
 
+        if self._starts >= self._max_starts:
+            msg = f'Start limit reached: at most {self._max_starts} confirmed starts per server session'
+            raise PermissionError(msg)
         response = self.request('POST', rest_endpoint.ITEM_TRIGGER(job_path=job_path, action=action))
+        self._starts += 1
         location = response.headers.get('Location') or ''
         match = re.search(r'/queue/item/(\d+)/?$', location)
         result['queueItem'] = int(match.group(1)) if match else None
         result['queueUrl'] = location or None
+        self._audit('trigger_build', job=fullname, queueItem=result['queueItem'])
         return result
 
     def stop_build(self, *, fullname: str, number: int, confirm: bool = False) -> dict:
@@ -773,6 +823,7 @@ class Jenkins:
         result = {'job': fullname, 'number': number, 'action': 'stop', 'building': True, 'dryRun': not confirm}
         if confirm:
             self.request('POST', rest_endpoint.BUILD_STOP(job_path=job_path, number=number))
+            self._audit('stop_build', job=fullname, number=number)
         return result
 
     def _queue_item_job(self, task_url: str) -> str | None:
@@ -819,6 +870,7 @@ class Jenkins:
         result = {'queueItem': id, 'job': job, 'action': 'cancel', 'dryRun': not confirm}
         if confirm:
             self.request('POST', rest_endpoint.QUEUE_CANCEL_ITEM(id=id))
+            self._audit('cancel_queue_item', job=job, queueItem=id)
         return result
 
     def get_jobs_status(
@@ -968,6 +1020,10 @@ class Jenkins:
         Returns:
             A list of ItemType objects matching the specified patterns.
         """
+        for pattern in (class_pattern, fullname_pattern, color_pattern):
+            if pattern and len(pattern) > self.MAX_PATTERN_LENGTH:
+                msg = f'pattern is longer than {self.MAX_PATTERN_LENGTH} characters'
+                raise ValueError(msg)
         class_re, fullname_re, color_re = (
             re.compile(pattern) if pattern else None for pattern in (class_pattern, fullname_pattern, color_pattern)
         )

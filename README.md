@@ -22,7 +22,9 @@ do not run it by hand: the plugin's `.mcp.json` starts it and supplies the crede
 | Scope | Whole instance | Optional `--allowed-folders` | Limit reads to the folders you care about |
 | Output size | Unbounded | Console 5000 lines, 2000 chars per line, regex up to 200 chars, artifacts 5 MiB; listings are compact by default (`fullname`, `kind`, `color`, max 200 rows, `fields` and `limit` to change) | One call can not flood a model's context |
 | Recipe tools | none | `get_jobs_status` (last build of many jobs, one request) and `get_item_summary` (a job's repo, branch, steps, triggers, downstream in ~1 KB) | Replace N+1 calls and raw `config.xml` dumps |
-| `get_item_config` | Raw `config.xml` | Secret-looking values replaced by `[REDACTED]` (best effort) | Config files can hold tokens |
+| Secret redaction | Raw config, console, scripts, parameters | Secret-looking values replaced by `[REDACTED]` in `get_item_config`, console output, build scripts, build parameters and parameter defaults: `NAME=value`, quoted or XML-escaped, `curl -u`, URL userinfo, Bearer tokens, `{encrypted}` values (best effort, not a guarantee) | Config files, logs and pipelines can hold tokens |
+| Human approval | n/a | With the write tools on, a confirmed start, stop or cancel also asks the user through the client (MCP elicitation) and is refused if the client cannot ask | `confirm=true` alone can be set by a model after reading planted text |
+| Audit and cap | n/a | Every confirmed write is appended to a JSONL audit file; at most 5 confirmed starts per server session | After an incident you can tell AI-started builds from manual ones, and a loop cannot queue many deploys |
 | File logging | Wrote the URL and username to `~/.mcp_jenkins/log.log` | None | No credentials metadata on disk |
 | `list_builds` | Missing | Added | Build history of a job, newest first |
 | Dependencies | Lockfile with advisories | Refreshed lockfile | |
@@ -45,6 +47,9 @@ uvx --from git+https://github.com/microtechos/jenkins-mcp@<tag-or-sha> mcp-jenki
 | `--allow-trigger` | `JENKINS_ALLOW_TRIGGER` | Register `trigger_build`, `stop_build` and `cancel_queue_item` (default off) |
 | `--trigger-jobs` | `JENKINS_TRIGGER_JOBS` | Comma-separated exact job full names `trigger_build` may start (and the other two may stop or cancel). Empty = none |
 | `--stop-jobs` | `JENKINS_STOP_JOBS` | Extra exact job full names that only `stop_build` and `cancel_queue_item` may act on, e.g. the rest of a release chain. They can never be started |
+| `--require-approval/--no-require-approval` | `JENKINS_REQUIRE_APPROVAL` | Ask the user before any confirmed write (default on) |
+| `--audit-log` | `JENKINS_AUDIT_LOG` | JSONL file for confirmed writes (default with `--allow-trigger`: `~/.microtech/jenkins-mcp-audit.jsonl`) |
+| `--max-starts` | `JENKINS_MAX_STARTS` | Confirmed `trigger_build` starts per server session (default 5) |
 | `--allowed-folders` | `JENKINS_ALLOWED_FOLDERS` | Comma-separated folder/job full names that may be read, e.g. `Branch-Retail,Branch-Salon`. Empty = no restriction |
 | `--env-file` | | Load the settings above from a file (never auto-discovered) |
 

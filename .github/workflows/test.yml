@@ -15,6 +15,9 @@ on:
       - tests/**
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -31,7 +34,7 @@ jobs:
           python-version-file: "pyproject.toml"
 
       - name: Install the project
-        run: uv sync --all-extras --dev
+        run: uv sync --locked --all-extras --dev
 
       - name: Run tests
         # For example, using `pytest`

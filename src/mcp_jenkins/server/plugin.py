@@ -14,7 +14,7 @@ async def get_all_plugins(ctx: Context, depth: int = 2) -> list[dict]:
     Returns:
         A list of all installed plugins
     """
-    return jenkins(ctx).get_plugins(depth=depth)
+    return jenkins(ctx).get_plugins(depth=max(0, min(depth, 3)))
 
 
 @mcp.tool(tags={'read'})
@@ -30,7 +30,7 @@ async def get_plugin(ctx: Context, short_name: str, depth: int = 2) -> dict | No
     Returns:
         The plugin details, or None if not found
     """
-    return jenkins(ctx).get_plugin(short_name=short_name, depth=depth)
+    return jenkins(ctx).get_plugin(short_name=short_name, depth=max(0, min(depth, 3)))
 
 
 @mcp.tool(tags={'read'})

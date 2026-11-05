@@ -961,7 +961,7 @@ wheels = [
 
 [[package]]
 name = "mcp-jenkins"
-version = "3.6.0+microtech.3"
+version = "3.6.0+microtech.4"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },

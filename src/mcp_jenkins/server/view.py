@@ -31,4 +31,4 @@ async def get_view(ctx: Context, view_path: str, depth: int = 0) -> dict:
     Returns:
         A dict with the view's name, jobs list, and/or nested views.
     """
-    return jenkins(ctx).get_view(view_path=view_path, depth=depth)
+    return jenkins(ctx).get_view(view_path=view_path, depth=max(0, min(depth, 3)))

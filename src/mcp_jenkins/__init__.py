@@ -1,10 +1,15 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 import click
 from dotenv import load_dotenv
 from loguru import logger
+
+# Quiet by default: request URLs are not written to the MCP log at DEBUG level.
+logger.remove()
+logger.add(sys.stderr, level='INFO')
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -66,6 +71,26 @@ def _load_env_file(ctx: click.Context, param: click.Parameter, value: str | None
     '(for example the rest of a release chain). They can never be started by trigger_build.',
 )
 @click.option(
+    '--require-approval/--no-require-approval',
+    default=True,
+    envvar='JENKINS_REQUIRE_APPROVAL',
+    help='Ask the user (MCP elicitation) before any confirmed start, stop or cancel. Default on; if the client '
+    'cannot ask, the action is refused.',
+)
+@click.option(
+    '--audit-log',
+    default='',
+    envvar='JENKINS_AUDIT_LOG',
+    help='JSONL file recording every confirmed start, stop and cancel. Default with --allow-trigger: '
+    '~/.microtech/jenkins-mcp-audit.jsonl.',
+)
+@click.option(
+    '--max-starts',
+    default=5,
+    envvar='JENKINS_MAX_STARTS',
+    help='Maximum confirmed trigger_build starts per server session. Default 5.',
+)
+@click.option(
     '--read-only',
     default=True,
     is_flag=True,
@@ -100,6 +125,9 @@ def main(
     allow_trigger: bool,  # noqa: FBT001
     trigger_jobs: str,
     stop_jobs: str,
+    require_approval: bool,  # noqa: FBT001
+    audit_log: str,
+    max_starts: int,
     read_only: bool,  # noqa: ARG001, FBT001
     tool_regex: str,
     jenkins_session_singleton: bool,  # noqa: FBT001
@@ -119,6 +147,11 @@ def main(
     os.environ['jenkins_allow_trigger'] = str(allow_trigger).lower()
     os.environ['jenkins_trigger_jobs'] = trigger_jobs
     os.environ['jenkins_stop_jobs'] = stop_jobs
+    os.environ['jenkins_require_approval'] = str(require_approval).lower()
+    if allow_trigger and not audit_log:
+        audit_log = str(Path.home() / '.microtech' / 'jenkins-mcp-audit.jsonl')
+    os.environ['jenkins_audit_log'] = audit_log
+    os.environ['jenkins_max_starts'] = str(max_starts)
 
     from mcp_jenkins.server import mcp
 
