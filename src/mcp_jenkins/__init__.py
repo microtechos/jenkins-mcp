@@ -7,9 +7,10 @@ import click
 from dotenv import load_dotenv
 from loguru import logger
 
-# Quiet by default: request URLs are not written to the MCP log at DEBUG level.
+# Quiet by default: request URLs are not written to the MCP log at DEBUG level. MCP_JENKINS_LOG_LEVEL=DEBUG is a
+# deliberate opt-in, for example to see which protocol era an approval prompt used. Logs go to stderr only.
 logger.remove()
-logger.add(sys.stderr, level='INFO')
+logger.add(sys.stderr, level='DEBUG' if os.environ.get('MCP_JENKINS_LOG_LEVEL', '').upper() == 'DEBUG' else 'INFO')
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
